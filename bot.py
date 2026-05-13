@@ -14,6 +14,10 @@ OFFICE_CHAT_ID   = os.environ.get("OFFICE_CHAT_ID", "")
 LOG_BOT_URL      = os.environ.get("LOG_BOT_URL", "")
 HTTP_PORT        = 8080
 
+# ALLOWED_USERS: comma-separated IDs, falls back to YOUR_TELEGRAM_ID
+_raw = os.environ.get("ALLOWED_USERS", "")
+ALLOWED_USERS = set(int(x.strip()) for x in _raw.split(",") if x.strip()) if _raw else {YOUR_TELEGRAM_ID}
+
 client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 conversation_history = {}
 
@@ -61,7 +65,7 @@ async def handle_task(request):
     return web.json_response({"status": "ok", "response": response})
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != YOUR_TELEGRAM_ID:
+    if update.effective_user.id not in ALLOWED_USERS:
         return
     if update.effective_chat.type in ["group", "supergroup"]:
         return
