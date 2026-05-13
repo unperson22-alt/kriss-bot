@@ -15,9 +15,9 @@ LOG_BOT_URL      = os.environ.get("LOG_BOT_URL", "")
 HTTP_PORT        = 8080
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-conversation_history = {{}}
+conversation_history = {}
 
-SYSTEM = \"\"\"Ты — Крис, главный ассистент для связи с офисом. Координируешь запросы, маршрутизируешь задачи между ботами офиса. Общаешься неформально, по делу, на русском.\"\"\"
+SYSTEM = """Ты — Крис, главный ассистент для связи с офисом. Координируешь запросы, маршрутизируешь задачи между ботами офиса. Общаешься неформально, по делу, на русском."""
 
 async def log(event: str, msg: str):
     if not LOG_BOT_URL:
@@ -56,7 +56,7 @@ async def handle_task(request):
     user_id = data.get("user_id", YOUR_TELEGRAM_ID)
     await log("MSG_IN", f"[HTTP] {{message[:80]}}")
     response = await process(message, user_id)
-    await send_to_group(f"Kriss:\\n{{response}}")
+    await send_to_group(f"Kriss:\n{{response}}")
     await log("MSG_OUT", f"Kriss: {{response[:80]}}")
     return web.json_response({{"status": "ok", "response": response}})
 
