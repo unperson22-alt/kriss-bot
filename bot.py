@@ -48,7 +48,7 @@ async def process(message: str, user_id: int) -> str:
     conversation_history[user_id].append({"role": "user", "content": message})
     if len(conversation_history[user_id]) > 20:
         conversation_history[user_id] = conversation_history[user_id][-10:]
-    r = client.messages.create(model="claude-sonnet-4-6", max_tokens=1024,
+    r = client.messages.create(model="claude-sonnet-4-6", max_tokens=4096,
         system=SYSTEM, messages=conversation_history[user_id])
     text = r.content[0].text
     conversation_history[user_id].append({"role": "assistant", "content": text})
@@ -92,4 +92,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
