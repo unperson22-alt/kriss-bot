@@ -179,12 +179,13 @@ async def handle_task(request):
         data = await request.json()
         message = data.get("message", "")
         user_id = data.get("user_id", YOUR_TELEGRAM_ID)
+        sender = data.get("sender", "HTTP")
         if not message:
             return web.json_response({"error": "empty message"}, status=400)
-        await log("MSG_IN", f"[HTTP] {message[:80]}")
+        await log("MSG_IN", f"[{sender}] {message}")
         response = await process(message, user_id)
         await send_to_group(f"Крис:\n{response}")
-        await log("MSG_OUT", f"Крис: {response[:80]}")
+        await log("MSG_OUT", f"Крис: {response}")
         return web.json_response({"status": "ok", "response": response})
     except Exception as e:
         logger.error(f"/task error: {e}")
@@ -214,8 +215,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = update.message.text
     user_id = update.effective_user.id
+    user_name = update.effective_user.first_name or update.effective_user.username or str(user_id)
 
-    await log("MSG_IN", msg[:80])
+    await log("MSG_IN", f"[{user_name}] {msg}")
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     # Learn trigger
@@ -225,7 +227,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     response = await process(msg, user_id)
-    await log("MSG_OUT", f"Крис: {response[:80]}")
+    await log("MSG_OUT", f"Крис: {response}")
     await send_long(update, response)
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
@@ -253,7 +255,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
-
