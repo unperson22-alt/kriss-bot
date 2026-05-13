@@ -90,9 +90,12 @@ def is_learn_trigger(text: str) -> bool:
 # ── TRUNCATION DETECTION ─────────────────────────────────────────────────────
 def is_truncated(text: str) -> bool:
     text = text.strip()
-    if not text:
+    if not text or len(text) > 500:
         return False
-    return text[-1] not in ".!?»)\"'…—\n"
+    last = text[-1]
+    if ord(last) > 127:  # emoji or non-ascii = treat as complete
+        return False
+    return last not in ".!?»)\"'…—\n"
 
 # ── AI PROCESS ───────────────────────────────────────────────────────────────
 async def process(message: str, user_id: int) -> str:
@@ -250,5 +253,6 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
