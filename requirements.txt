@@ -2,3 +2,4 @@ python-telegram-bot==21.3
 anthropic
 aiohttp
 httpx
+redis>=4.2.0
