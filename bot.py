@@ -196,6 +196,13 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Спрашивай что угодно, помогу с любыми задачами."
     )
 
+async def send_long(update: Update, text: str):
+    """Split and send messages exceeding Telegram 4096 char limit."""
+    limit = 4000
+    while text:
+        chunk, text = text[:limit], text[limit:]
+        await update.message.reply_text(chunk)
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ALLOWED_USERS:
         return
@@ -216,7 +223,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     response = await process(msg, user_id)
     await log("MSG_OUT", f"Крис: {response[:80]}")
-    await update.message.reply_text(response)
+    await send_long(update, response)
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 async def main():
@@ -243,3 +250,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
