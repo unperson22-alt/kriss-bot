@@ -22,6 +22,50 @@ _raw = os.environ.get("ALLOWED_USERS", "")
 ALLOWED_USERS = set(int(x.strip()) for x in _raw.split(",") if x.strip()) if _raw else {YOUR_TELEGRAM_ID}
 
 claude  = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+
+# ── Ollama config ────────────────────────────────────────────────────────────
+OLLAMA_HOST    = os.environ.get("OLLAMA_HOST", "").strip().rstrip("/\\")
+OLLAMA_MODEL   = os.environ.get("OLLAMA_MODEL", "gemma3:4b")
+OLLAMA_ENABLED = os.environ.get("OLLAMA_ENABLED", "").lower() in ("1", "true", "yes")
+
+
+class _OllamaResult:
+    def __init__(self, text):
+        from types import SimpleNamespace
+        self.content = [SimpleNamespace(text=text)]
+
+
+def _try_ollama(messages, system=None, timeout=20.0):
+    if not (OLLAMA_ENABLED and OLLAMA_HOST):
+        return None
+    try:
+        ol_messages = []
+        if system:
+            ol_messages.append({"role": "system", "content": system})
+        for m in messages:
+            content = m["content"] if isinstance(m["content"], str) else str(m["content"])
+            ol_messages.append({"role": m["role"], "content": content})
+        with httpx.Client(timeout=timeout) as cli:
+            r = cli.post(
+                f"{OLLAMA_HOST}/api/chat",
+                json={"model": OLLAMA_MODEL, "messages": ol_messages,
+                      "stream": False, "keep_alive": "30m"},
+            )
+            if r.status_code != 200:
+                return None
+            text = r.json().get("message", {}).get("content", "")
+            return _OllamaResult(text) if text else None
+    except Exception as e:
+        logger.info(f"Ollama unavailable, fallback to Anthropic: {type(e).__name__}: {e}")
+        return None
+
+
+def _call_llm(_client, **kwargs):
+    """LLM call: tries Ollama first, falls back to Anthropic."""
+    ol = _try_ollama(kwargs.get("messages", []), kwargs.get("system"))
+    if ol is not None:
+        return ol
+    return _client.messages.create(**kwargs)
 redis_client: aioredis.Redis = None
 
 SYSTEM_BASE = (
@@ -99,7 +143,7 @@ async def process(message: str, user_id: int) -> str:
     system = await build_system(user_id)
 
     try:
-        r = claude.messages.create(
+        r = _call_llm(claude, 
             model="claude-sonnet-4-6",
             max_tokens=4096,
             system=system,
@@ -111,7 +155,7 @@ async def process(message: str, user_id: int) -> str:
             logger.warning(f"Truncated response detected for {user_id}, retrying...")
             history.append({"role": "assistant", "content": text})
             history.append({"role": "user", "content": "Продолжи с того места где остановился."})
-            r2 = claude.messages.create(
+            r2 = _call_llm(claude, 
                 model="claude-sonnet-4-6",
                 max_tokens=4096,
                 system=system,
