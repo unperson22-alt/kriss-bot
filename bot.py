@@ -309,7 +309,8 @@ async def handle_task(request):
             return web.json_response({"error": "empty message"}, status=400)
         await log("MSG_IN", message, from_=sender, to_=BOT_NAME)
         response = await process(message, user_id)
-        await send_to_group(f"Крис:\n{response}")
+        if data.get("notify", True):
+            await send_to_group(f"Крис:\n{response}")
         await log("MSG_OUT", f"{BOT_NAME}: {response}", from_=BOT_NAME, to_=sender)
         return web.json_response({"status": "ok", "response": response})
     except Exception as e:
