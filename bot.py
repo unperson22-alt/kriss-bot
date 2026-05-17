@@ -487,6 +487,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await log("MSG_OUT", f"{BOT_NAME}: {response}", from_=BOT_NAME, to_=user_name)
     await send_long(update, response)
 
+
+async def weekly_review_loop():
+    """Еженедельный пересмотр профилей всех пользователей (каждые 7 дней)."""
+    while True:
+        await asyncio.sleep(7 * 24 * 3600)
+        try:
+            keys = []
+            async for key in redis_client.scan_iter(f"history:{BOT_NAME}:*"):
+                keys.append(key)
+            for key in keys:
+                uid = int(key.decode().split(":")[-1])
+                await weekly_review(uid)
+            logger.info(f"weekly_review_loop done for {len(keys)} users")
+        except Exception as e:
+            logger.error(f"weekly_review_loop error: {e}")
+
 async def main():
     global redis_client
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=False)
