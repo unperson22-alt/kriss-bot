@@ -130,6 +130,64 @@ async def redis_add_note(user_id: int, note: str):
     except Exception as e:
         logger.warning(f"Redis add note failed: {e}")
 
+async def auto_extract_interests(message: str, user_id: int):
+    """Фоновое авто-извлечение фактов о пользователе через Haiku."""
+    try:
+        existing = await redis_get_notes(user_id)
+        r = claude.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=150,
+            system=(
+                "Ты извлекаешь факты о пользователе из его сообщений. "
+                "Найди конкретные факты, интересы, предпочтения или важные детали О ПОЛЬЗОВАТЕЛЕ. "
+                "Если нашёл что-то новое и конкретное — верни одну строку начинающуюся с [auto]. "
+                "Если ничего конкретного нет или это уже есть в заметках — верни пустую строку. "
+                "Не записывай временные состояния (устал, болит голова сегодня). "
+                "Только устойчивые факты: работа, семья, питание, хобби, предпочтения."
+            ),
+            messages=[{"role": "user", "content":
+                f"Сообщение: {message}\n\nУже известно:\n{existing or '(ничего)'}"}]
+        )
+        fact = r.content[0].text.strip()
+        if fact.startswith("[auto]"):
+            await redis_add_note(user_id, fact)
+            logger.info(f"Auto-extracted for {user_id}: {fact}")
+    except Exception as e:
+        logger.warning(f"auto_extract_interests failed: {e}")
+
+
+async def weekly_review(user_id: int):
+    """Еженедельный пересмотр профиля — компактизация заметок через Sonnet."""
+    try:
+        history = await redis_get_history(user_id)
+        notes = await redis_get_notes(user_id)
+        if not history and not notes:
+            return
+        history_text = "\n".join(
+            f"{m['role']}: {m['content'][:200]}" for m in history[-30:]
+        )
+        r = claude.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=400,
+            system=(
+                "Ты обновляешь профиль пользователя на основе переписки и старых заметок. "
+                "Создай компактный список фактов о пользователе (не более 10 строк). "
+                "Каждый факт с новой строки, начинается с [auto]. "
+                "Убери дубли, объедини похожее, удали устаревшее. "
+                "Только конкретные устойчивые факты."
+            ),
+            messages=[{"role": "user", "content":
+                f"Старые заметки:\n{notes or '(нет)'}\n\n"
+                f"Последние сообщения:\n{history_text}"}]
+        )
+        new_profile = r.content[0].text.strip()
+        await redis_client.set(f"notes:{BOT_NAME}:{user_id}", new_profile)
+        logger.info(f"Weekly review done for {user_id}")
+    except Exception as e:
+        logger.warning(f"weekly_review failed: {e}")
+
+
+
 async def build_system(user_id: int) -> str:
     notes = await redis_get_notes(user_id)
     if notes:
@@ -221,6 +279,24 @@ def check_secret(request) -> bool:
         return True
     return request.headers.get("X-Secret-Token") == HTTP_SECRET
 
+
+async def handle_weekly_review(request):
+    """Cloudflare Cron вызывает этот endpoint раз в неделю."""
+    if not check_secret(request):
+        return web.json_response({"error": "unauthorized"}, status=401)
+    try:
+        # Получаем всех пользователей у которых есть история
+        keys = []
+        async for key in redis_client.scan_iter(f"history:{BOT_NAME}:*"):
+            keys.append(key)
+        for key in keys:
+            uid = int(key.decode().split(":")[-1])
+            await weekly_review(uid)
+        return web.json_response({"status": "ok", "users": len(keys)})
+    except Exception as e:
+        logger.error(f"/cron/weekly_review error: {e}")
+        return web.json_response({"error": str(e)}, status=500)
+
 async def handle_task(request):
     if not check_secret(request):
         return web.json_response({"error": "unauthorized"}, status=401)
@@ -273,6 +349,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     response = await process(msg, user_id)
+    asyncio.create_task(auto_extract_interests(msg, user_id))
     await log("MSG_OUT", f"{BOT_NAME}: {response}", from_=BOT_NAME, to_=user_name)
     await send_long(update, response)
 
@@ -283,6 +360,7 @@ async def main():
 
     app_http = web.Application()
     app_http.router.add_post("/task", handle_task)
+    app_http.router.add_post("/cron/weekly_review", handle_weekly_review)
     runner = web.AppRunner(app_http)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", HTTP_PORT).start()
