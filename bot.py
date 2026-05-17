@@ -1,4 +1,4 @@
-import os, logging, asyncio, httpx, json
+import os, logging, asyncio, httpx, json, base64
 from aiohttp import web
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
@@ -13,6 +13,7 @@ ANTHROPIC_KEY    = os.environ["ANTHROPIC_API_KEY"]
 YOUR_TELEGRAM_ID = int(os.environ["YOUR_TELEGRAM_ID"])
 OFFICE_CHAT_ID   = os.environ.get("OFFICE_CHAT_ID", "")
 LOG_BOT_URL      = os.environ.get("LOG_BOT_URL", "")
+BUG_CHAT_ID      = os.environ.get("BUG_CHAT_ID", "-5197140411")
 REDIS_URL        = os.environ.get("REDIS_URL", "redis://localhost:6379")
 HTTP_SECRET      = os.environ.get("HTTP_SECRET", "")
 HTTP_PORT        = 8080
@@ -194,6 +195,101 @@ async def build_system(user_id: int) -> str:
         return SYSTEM_BASE + f"\n\nЗаметки о пользователе:\n{notes}"
     return SYSTEM_BASE
 
+
+IMAGE_TRIGGERS = [
+    "нарисуй", "нарисуйте", "сгенери", "сгенерируй",
+    "покажи картинку", "создай картинку", "draw", "generate image",
+    "нарисуй мне", "сделай картинку", "изобрази"
+]
+
+def wants_image(text: str) -> bool:
+    t = text.lower()
+    return any(trigger in t for trigger in IMAGE_TRIGGERS)
+
+async def generate_image(prompt: str) -> str | None:
+    """Генерация через Pollinations (бесплатно, без токена)."""
+    try:
+        import urllib.parse
+        encoded = urllib.parse.quote(prompt)
+        url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&nologo=true"
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.get(url)
+            if r.status_code == 200:
+                return url
+    except Exception as e:
+        logger.warning(f"generate_image failed: {e}")
+    return None
+
+async def process_with_image(caption: str, user_id: int, image_b64: str, media_type: str = "image/jpeg") -> str:
+    """Claude vision — анализ изображения. Ollama пропускается (не поддерживает vision)."""
+    history = await redis_get_history(user_id)
+    system = await build_system(user_id)
+    try:
+        r = claude.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2048,
+            system=system,
+            messages=history + [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_b64}},
+                    {"type": "text", "text": caption or "Что на этом фото? Опиши подробно."}
+                ]
+            }]
+        )
+        response = r.content[0].text
+        history.append({"role": "user", "content": f"[фото] {caption}"})
+        history.append({"role": "assistant", "content": response})
+        if len(history) > 20:
+            history = history[-10:]
+        await redis_save_history(user_id, history)
+        return response
+    except Exception as e:
+        logger.error(f"process_with_image error: {e}")
+        return "⚠️ Не смог проанализировать фото. Попробуй ещё раз."
+
+async def report_bug(description: str, error: str = ""):
+    """Репорт бага в Bug Lessons группу."""
+    if not BUG_CHAT_ID:
+        return
+    text = f"🐛 [{BOT_NAME}] {description}"
+    if error:
+        text += f"\nError: {error[:300]}"
+    try:
+        async with httpx.AsyncClient() as c:
+            await c.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                json={"chat_id": BUG_CHAT_ID, "text": text}, timeout=10
+            )
+    except Exception as e:
+        logger.error(f"report_bug failed: {e}")
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ALLOWED_USERS:
+        return
+    if update.effective_chat.type in ["group", "supergroup"]:
+        return
+
+    user_id = update.effective_user.id
+    user_name = update.effective_user.first_name or str(user_id)
+    caption = update.message.caption or "Что на этом фото?"
+
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    try:
+        photo = update.message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        file_bytes = await file.download_as_bytearray()
+        image_b64 = base64.b64encode(bytes(file_bytes)).decode()
+        response = await process_with_image(caption, user_id, image_b64)
+        await log("MSG_IN", f"[фото] {caption}", from_=user_name, to_=BOT_NAME)
+        await log("MSG_OUT", f"{BOT_NAME}: {response[:80]}", from_=BOT_NAME, to_=user_name)
+        await send_long(update, response)
+    except Exception as e:
+        logger.error(f"handle_photo error: {e}")
+        asyncio.create_task(report_bug("handle_photo crashed", str(e)))
+        await update.message.reply_text("⚠️ Не смог обработать фото. Попробуй ещё раз.")
+
+
 def is_learn_trigger(text: str) -> bool:
     t = text.lower()
     return any(trigger in t for trigger in LEARN_TRIGGERS)
@@ -349,6 +445,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Запомнил.")
         return
 
+    if wants_image(msg):
+        await update.message.reply_text("🎨 Рисую, подожди...")
+        url = await generate_image(msg)
+        if url:
+            await update.message.reply_photo(photo=url, caption=f"🎨 {msg[:200]}")
+        else:
+            await update.message.reply_text("❌ Не получилось нарисовать. Попробуй ещё раз.")
+        return
+
     response = await process(msg, user_id)
     asyncio.create_task(auto_extract_interests(msg, user_id))
     await log("MSG_OUT", f"{BOT_NAME}: {response}", from_=BOT_NAME, to_=user_name)
@@ -368,6 +473,7 @@ async def main():
 
     ptb = Application.builder().token(TELEGRAM_TOKEN).build()
     ptb.add_handler(CommandHandler("start", handle_start))
+    ptb.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     ptb.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     async with ptb:
