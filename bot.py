@@ -360,7 +360,6 @@ async def main():
 
     app_http = web.Application()
     app_http.router.add_post("/task", handle_task)
-    app_http.router.add_post("/cron/weekly_review", handle_weekly_review)
     runner = web.AppRunner(app_http)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", HTTP_PORT).start()
@@ -374,6 +373,7 @@ async def main():
         await ptb.start()
         await ptb.updater.start_polling(drop_pending_updates=True)
         logger.info("Крис запущен ✅")
+        asyncio.create_task(weekly_review_loop())
         await asyncio.Event().wait()
 
 if __name__ == "__main__":
