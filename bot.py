@@ -206,8 +206,30 @@ def wants_image(text: str) -> bool:
     t = text.lower()
     return any(trigger in t for trigger in IMAGE_TRIGGERS)
 
-async def generate_image(prompt: str) -> str | None:
-    """Генерация через Pollinations (бесплатно, без токена)."""
+REPLICATE_TOKEN  = os.environ.get("REPLICATE_API_TOKEN", "")
+
+async def _generate_replicate(prompt: str) -> str | None:
+    if not REPLICATE_TOKEN:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=60) as c:
+            r = await c.post(
+                "https://api.replicate.com/v1/models/black-forest-labs/flux-schnell/predictions",
+                headers={"Authorization": f"Bearer {REPLICATE_TOKEN}", "Content-Type": "application/json", "Prefer": "wait"},
+                json={"input": {"prompt": prompt, "num_outputs": 1, "output_format": "webp"}}
+            )
+            if r.status_code in (200, 201):
+                data = r.json()
+                output = data.get("output")
+                if isinstance(output, list) and output:
+                    return output[0]
+                elif isinstance(output, str):
+                    return output
+    except Exception as e:
+        logger.warning(f"_generate_replicate failed: {e}")
+    return None
+
+async def _generate_pollinations(prompt: str) -> str | None:
     try:
         import urllib.parse
         encoded = urllib.parse.quote(prompt)
@@ -217,8 +239,14 @@ async def generate_image(prompt: str) -> str | None:
             if r.status_code == 200:
                 return url
     except Exception as e:
-        logger.warning(f"generate_image failed: {e}")
+        logger.warning(f"_generate_pollinations failed: {e}")
     return None
+
+async def generate_image(prompt: str) -> str | None:
+    url = await _generate_replicate(prompt)
+    if url:
+        return url
+    return await _generate_pollinations(prompt)
 
 async def process_with_image(caption: str, user_id: int, image_b64: str, media_type: str = "image/jpeg") -> str:
     """Claude vision — анализ изображения. Ollama пропускается (не поддерживает vision)."""
