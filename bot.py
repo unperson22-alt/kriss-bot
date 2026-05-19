@@ -521,6 +521,63 @@ async def send_long(update: Update, text: str):
         chunk, text = text[:limit], text[limit:]
         await update.message.reply_text(chunk)
 
+
+PHOTO_SEARCH_TRIGGERS = [
+    "знайди фото", "знайди картинку", "покажи фото", "покажи картинку",
+    "відправ фото", "відправ картинку", "пришли фото", "пришли картинку",
+    "хочу фото", "хочу картинку", "фото котик", "фото кот",
+    "найди фото", "найди картинку", "покажи картинку", "пришли картинку",
+    "send photo", "find photo", "show photo", "find image", "show image",
+    "знайди зображення", "покажи зображення"
+]
+
+def wants_photo_search(text: str) -> bool:
+    t = text.lower()
+    # Явные триггеры
+    if any(trigger in t for trigger in PHOTO_SEARCH_TRIGGERS):
+        return True
+    # "фото/картинку/зображення + [чего-то] з інтернету/онлайн"
+    if any(w in t for w in ["з інтернету", "из интернета", "онлайн", "online"]):
+        if any(w in t for w in ["фото", "картинк", "зображен", "photo", "image", "picture"]):
+            return True
+    return False
+
+async def find_and_send_photo(update, query: str) -> bool:
+    """Ищет фото через web_search и отправляет в чат. Возвращает True если успешно."""
+    import re
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            # Bing Image Search через web_search API не доступен напрямую
+            # Используем Anthropic web_search чтобы найти прямой URL картинки
+            r = await claude_async.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=200,
+                system="Ты помощник. Найди прямую ссылку на изображение (заканчивается на .jpg, .jpeg, .png, .gif, .webp) по запросу пользователя. Верни ТОЛЬКО прямой URL картинки, без объяснений. Если не можешь найти — верни слово NONE.",
+                messages=[{"role": "user", "content": f"Найди прямую ссылку на картинку: {query}"}],
+                tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}]
+            )
+            texts = [b.text for b in r.content if hasattr(b, "text") and b.text]
+            url = " ".join(texts).strip()
+            
+            if not url or url == "NONE" or len(url) < 10:
+                return False
+            
+            # Извлекаем URL если есть лишний текст
+            urls = re.findall(r'https?://\S+\.(?:jpg|jpeg|png|gif|webp)\S*', url, re.IGNORECASE)
+            if not urls:
+                # Попробуем любой https URL
+                urls = re.findall(r'https?://\S+', url)
+            
+            if not urls:
+                return False
+            
+            photo_url = urls[0].rstrip('.,)')
+            await update.message.reply_photo(photo=photo_url)
+            return True
+    except Exception as e:
+        logger.warning(f"find_and_send_photo failed: {e}")
+        return False
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ALLOWED_USERS:
         return
@@ -545,6 +602,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text("❌ Не получилось нарисовать. Попробуй ещё раз.")
         return
+
+    if wants_photo_search(msg):
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_photo")
+        success = await find_and_send_photo(update, msg)
+        if success:
+            await log("MSG_OUT", f"{BOT_NAME}: [фото по запросу]", from_=BOT_NAME, to_=user_name)
+            return
+        # Если не нашли — идём в обычный process() который объяснит
 
     response = await process(msg, user_id)
     asyncio.create_task(auto_extract_interests(msg, user_id))
