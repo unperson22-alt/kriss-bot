@@ -1,7 +1,7 @@
 import os, logging, asyncio, httpx, json, base64
 from aiohttp import web
 from telegram import Update
-from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
+from telegram.ext import Application, MessageHandler, MessageReactionHandler, CommandHandler, filters, ContextTypes
 import anthropic
 from anthropic import AsyncAnthropic
 import redis.asyncio as aioredis
@@ -19,6 +19,11 @@ REDIS_URL        = os.environ.get("REDIS_URL", "redis://localhost:6379")
 HTTP_SECRET      = os.environ.get("HTTP_SECRET", "")
 HTTP_PORT        = 8080
 BOT_NAME         = "Крис"
+BOT_NAME_LOWER   = "крисс"  # Redis ключ для /metrics (явный override)
+
+# Reactions classification → office:quality:{bot} (feedback loop)
+REACTION_UP   = {"👍", "❤️", "🔥", "🥰", "👏", "🎉", "🤩", "🙏"}
+REACTION_DOWN = {"👎", "💩", "🤬", "🤮", "😢"}
 
 _raw = os.environ.get("ALLOWED_USERS", "")
 ALLOWED_USERS = set(int(x.strip()) for x in _raw.split(",") if x.strip()) if _raw else {YOUR_TELEGRAM_ID}
@@ -431,15 +436,36 @@ async def log(event: str, msg: str, from_: str = "", to_: str = ""):
 
 async def send_to_group(text: str):
     if not OFFICE_CHAT_ID:
-        return
+        return None
     try:
         async with httpx.AsyncClient() as c:
-            await c.post(
+            r = await c.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
                 json={"chat_id": OFFICE_CHAT_ID, "text": text}, timeout=10
             )
+            data = r.json()
+            if data.get("ok"):
+                msg_id = data["result"]["message_id"]
+                await remember_my_message(int(OFFICE_CHAT_ID), msg_id)
+                return msg_id
     except Exception as e:
         logger.error(f"send_to_group failed: {e}")
+    return None
+
+
+# ── FEEDBACK LOOP: msg owner mapping for reactions ───────────────────────────
+async def remember_my_message(chat_id: int, message_id: int):
+    """Маркер 'это сообщение наше' для handle_reaction."""
+    if not redis_client:
+        return
+    try:
+        await redis_client.setex(
+            f"office:msg:{chat_id}:{message_id}",
+            86400 * 14,
+            BOT_NAME_LOWER.encode()
+        )
+    except Exception as e:
+        logger.warning(f"remember_my_message failed: {e}")
 
 def check_secret(request) -> bool:
     if not HTTP_SECRET:
@@ -666,6 +692,45 @@ async def cmd_reset_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("⚠️ Redis недоступен")
 
+async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Реакции 👍/👎 → office:quality:{bot} (HASH up/down)."""
+    reaction = update.message_reaction
+    if not reaction:
+        return
+
+    chat_id = reaction.chat.id
+    msg_id  = reaction.message_id
+
+    try:
+        owner_raw = await redis_client.get(f"office:msg:{chat_id}:{msg_id}")
+    except Exception as e:
+        logger.warning(f"reaction owner lookup failed: {e}")
+        return
+    if not owner_raw or owner_raw.decode() != BOT_NAME_LOWER:
+        return
+
+    old_emojis = {r.emoji for r in (reaction.old_reaction or []) if getattr(r, "emoji", None)}
+    new_emojis = {r.emoji for r in (reaction.new_reaction or []) if getattr(r, "emoji", None)}
+    added   = new_emojis - old_emojis
+    removed = old_emojis - new_emojis
+
+    delta_up   = sum(1 for e in added if e in REACTION_UP)   - sum(1 for e in removed if e in REACTION_UP)
+    delta_down = sum(1 for e in added if e in REACTION_DOWN) - sum(1 for e in removed if e in REACTION_DOWN)
+
+    if delta_up == 0 and delta_down == 0:
+        return
+
+    try:
+        key = f"office:quality:{BOT_NAME_LOWER}"
+        if delta_up:
+            await redis_client.hincrby(key, "up", delta_up)
+        if delta_down:
+            await redis_client.hincrby(key, "down", delta_down)
+        logger.info(f"REACTION msg={msg_id} added={added} removed={removed} du={delta_up} dd={delta_down}")
+    except Exception as e:
+        logger.warning(f"quality hincrby failed: {e}")
+
+
 async def main():
     global redis_client
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=False)
@@ -685,9 +750,10 @@ async def main():
     ptb.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     ptb.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+    ptb.add_handler(MessageReactionHandler(handle_reaction))
     async with ptb:
         await ptb.start()
-        await ptb.updater.start_polling(drop_pending_updates=True)
+        await ptb.updater.start_polling(drop_pending_updates=True, allowed_updates=["message", "edited_message", "message_reaction"])
         logger.info("Крис запущен ✅")
         asyncio.create_task(weekly_review_loop())
         await asyncio.Event().wait()
