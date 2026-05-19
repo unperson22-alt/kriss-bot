@@ -567,6 +567,42 @@ async def weekly_review_loop():
         except Exception as e:
             logger.error(f"weekly_review_loop error: {e}")
 
+
+async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /reset — сброс истории текущего пользователя (только owner может для любого)"""
+    caller_id = update.effective_user.id
+    
+    # Если owner передал user_id аргументом — сбрасываем того пользователя
+    args = context.args
+    if caller_id == YOUR_TELEGRAM_ID and args:
+        try:
+            target_id = int(args[0])
+        except:
+            target_id = caller_id
+    else:
+        target_id = caller_id
+    
+    key = f"history:{BOT_NAME}:{target_id}"
+    if redis_client:
+        await redis_client.delete(key)
+        await update.message.reply_text(f"✅ История сброшена для {target_id}")
+    else:
+        await update.message.reply_text("⚠️ Redis недоступен")
+
+async def cmd_reset_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /resetall — сброс истории ВСЕХ пользователей (только owner)"""
+    if update.effective_user.id != YOUR_TELEGRAM_ID:
+        return
+    if redis_client:
+        keys = []
+        async for key in redis_client.scan_iter(f"history:{BOT_NAME}:*"):
+            keys.append(key)
+        if keys:
+            await redis_client.delete(*keys)
+        await update.message.reply_text(f"✅ Сброшено {len(keys)} историй")
+    else:
+        await update.message.reply_text("⚠️ Redis недоступен")
+
 async def main():
     global redis_client
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=False)
@@ -581,6 +617,8 @@ async def main():
 
     ptb = Application.builder().token(TELEGRAM_TOKEN).build()
     ptb.add_handler(CommandHandler("start", handle_start))
+    ptb.add_handler(CommandHandler("reset", cmd_reset))
+    ptb.add_handler(CommandHandler("resetall", cmd_reset_all))
     ptb.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     ptb.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
