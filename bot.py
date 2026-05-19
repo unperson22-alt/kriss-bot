@@ -470,8 +470,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if is_learn_trigger(msg):
         await redis_add_note(user_id, msg)
-        await update.message.reply_text("✅ Запомнил.")
-        return
 
     if wants_image(msg):
         await update.message.reply_text("🎨 Рисую, подожди...")
