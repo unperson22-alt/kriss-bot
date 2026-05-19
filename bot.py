@@ -331,6 +331,14 @@ def is_truncated(text: str) -> bool:
         return False
     return last not in ".!?»)\"'…—\n"
 
+WEB_SEARCH_TOOL = [{"type": "web_search_20250305", "name": "web_search"}]
+
+
+def _extract_text(content_blocks) -> str:
+    """Извлекаем текст из ответа Claude — работает и с tool_use и без."""    texts = [b.text for b in content_blocks if hasattr(b, "text") and b.text]
+    return " ".join(texts).strip()
+
+
 async def process(message: str, user_id: int) -> str:
     history = await redis_get_history(user_id)
     history.append({"role": "user", "content": message})
@@ -340,28 +348,58 @@ async def process(message: str, user_id: int) -> str:
     system = await build_system(user_id)
 
     try:
-        r = _call_llm(claude, 
+        r = claude.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=4096,
             system=system,
-            messages=history
+            messages=history,
+            tools=WEB_SEARCH_TOOL
         )
-        text = r.content[0].text
 
-        if is_truncated(text):
-            logger.warning(f"Truncated response detected for {user_id}, retrying...")
-            history.append({"role": "assistant", "content": text})
-            history.append({"role": "user", "content": "Продолжи с того места где остановился."})
-            r2 = _call_llm(claude, 
+        # Если Claude решил искать — идём в agentic loop до end_turn
+        while r.stop_reason == "tool_use":
+            # Конвертируем content (list блоков) в формат для следующего хода
+            assistant_content = [b.model_dump() if hasattr(b, "model_dump") else b for b in r.content]
+            tool_results = []
+            for b in r.content:
+                if hasattr(b, "type") and b.type == "tool_use":
+                    # web_search — server-side tool, результат уже внутри блока
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": b.id,
+                        "content": getattr(b, "content", "") or ""
+                    })
+            loop_messages = history + [
+                {"role": "assistant", "content": assistant_content},
+                {"role": "user",      "content": tool_results}
+            ]
+            r = claude.messages.create(
                 model="claude-sonnet-4-6",
                 max_tokens=4096,
                 system=system,
-                messages=history
+                messages=loop_messages,
+                tools=WEB_SEARCH_TOOL
             )
-            continuation = r2.content[0].text
+
+        text = _extract_text(r.content)
+        if not text:
+            text = "⚠️ Не получил ответ от AI. Попробуй ещё раз."
+
+        if is_truncated(text):
+            logger.warning(f"Truncated response detected for {user_id}, retrying...")
+            retry_messages = history + [
+                {"role": "assistant", "content": text},
+                {"role": "user",      "content": "Продолжи с того места где остановился."}
+            ]
+            r2 = claude.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=4096,
+                system=system,
+                messages=retry_messages,
+                tools=WEB_SEARCH_TOOL
+            )
+            continuation = _extract_text(r2.content)
             text = text + " " + continuation
-            history.pop()
-            history.pop()
 
         history.append({"role": "assistant", "content": text})
         await redis_save_history(user_id, history)
