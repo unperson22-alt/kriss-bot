@@ -591,8 +591,6 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_reset_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /resetall — сброс истории ВСЕХ пользователей"""
-    if update.effective_user.id not in ALLOWED_USERS:
-        return
     if redis_client:
         keys = []
         async for key in redis_client.scan_iter(f"history:{BOT_NAME}:*"):
