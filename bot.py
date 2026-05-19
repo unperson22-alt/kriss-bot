@@ -3,6 +3,7 @@ from aiohttp import web
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 import anthropic
+from anthropic import AsyncAnthropic
 import redis.asyncio as aioredis
 
 logging.basicConfig(level=logging.INFO)
@@ -23,6 +24,7 @@ _raw = os.environ.get("ALLOWED_USERS", "")
 ALLOWED_USERS = set(int(x.strip()) for x in _raw.split(",") if x.strip()) if _raw else {YOUR_TELEGRAM_ID}
 
 claude  = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+claude_async = AsyncAnthropic(api_key=ANTHROPIC_KEY)
 
 # ── Ollama config ────────────────────────────────────────────────────────────
 OLLAMA_HOST    = os.environ.get("OLLAMA_HOST", "").strip().rstrip("/\\")
@@ -69,9 +71,11 @@ def _call_llm(_client, **kwargs):
     return _client.messages.create(**kwargs)
 redis_client: aioredis.Redis = None
 
-SYSTEM_BASE = """Ты — Крис, персональный ИИ-ассистент. Помогаешь с любыми вопросами: отвечаешь, объясняешь, советуешь, помогаешь с задачами. За твоей спиной — AI-офис со специализированными агентами, которых ты можешь привлекать при необходимости. Общаешься неформально, по делу, на русском. Не используй Markdown-разметку (##, **, таблицы, ---) — пиши простым текстом, для структуры используй цифры, тире и символ •.
+SYSTEM_BASE = """Ты — Крис, персональный ИИ-ассистент. Помогаешь с любыми вопросами: отвечаешь, объясняешь, советуешь, помогаешь с задачами. За твоей спиной — AI-офис со специализированными агентами, которых ты можешь привлекать при необходимости. Общаешься неформально, по делу. Язык — адаптируй под пользователя автоматически (пишет по-украински — отвечай по-украински, по-русски — по-русски). Не используй Markdown-разметку (##, **, таблицы, ---) — пиши простым текстом, для структуры используй цифры, тире и символ •.
 
 ## ВЕБ-РЕСЁРЧ
+
+У тебя есть инструмент web_search — РЕАЛЬНЫЙ поиск в интернете. Используй его ВСЕГДА когда нужна актуальная информация. Никогда не говори что у тебя нет доступа к интернету — это неправда.
 
 При поиске информации в интернете:
 
@@ -335,7 +339,8 @@ WEB_SEARCH_TOOL = [{"type": "web_search_20250305", "name": "web_search"}]
 
 
 def _extract_text(content_blocks) -> str:
-    """Извлекаем текст из ответа Claude — работает и с tool_use и без."""    texts = [b.text for b in content_blocks if hasattr(b, "text") and b.text]
+    """Извлекаем текст из ответа Claude — работает и с tool_use и без."""
+    texts = [b.text for b in content_blocks if hasattr(b, "text") and b.text]
     return " ".join(texts).strip()
 
 
@@ -348,7 +353,7 @@ async def process(message: str, user_id: int) -> str:
     system = await build_system(user_id)
 
     try:
-        r = claude.messages.create(
+        r = await claude_async.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=4096,
             system=system,
@@ -373,7 +378,7 @@ async def process(message: str, user_id: int) -> str:
                 {"role": "assistant", "content": assistant_content},
                 {"role": "user",      "content": tool_results}
             ]
-            r = claude.messages.create(
+            r = await claude_async.messages.create(
                 model="claude-sonnet-4-6",
                 max_tokens=4096,
                 system=system,
@@ -391,7 +396,7 @@ async def process(message: str, user_id: int) -> str:
                 {"role": "assistant", "content": text},
                 {"role": "user",      "content": "Продолжи с того места где остановился."}
             ]
-            r2 = claude.messages.create(
+            r2 = await claude_async.messages.create(
                 model="claude-sonnet-4-6",
                 max_tokens=4096,
                 system=system,
