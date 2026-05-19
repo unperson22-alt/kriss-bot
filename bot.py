@@ -464,6 +464,29 @@ async def handle_weekly_review(request):
         logger.error(f"/cron/weekly_review error: {e}")
         return web.json_response({"error": str(e)}, status=500)
 
+
+async def handle_reset_history(request: web.Request) -> web.Response:
+    """DELETE /reset_history?user_id=XXX — сброс истории пользователя"""
+    user_id_str = request.rel_url.query.get("user_id", "")
+    if not user_id_str:
+        # Сброс всех пользователей kriss
+        if redis_client:
+            keys = []
+            async for key in redis_client.scan_iter(f"history:{BOT_NAME}:*"):
+                keys.append(key)
+            if keys:
+                await redis_client.delete(*keys)
+            return web.json_response({"status": "ok", "deleted": len(keys)})
+        return web.json_response({"status": "no_redis"})
+    try:
+        user_id = int(user_id_str)
+        key = f"history:{BOT_NAME}:{user_id}"
+        if redis_client:
+            await redis_client.delete(key)
+        return web.json_response({"status": "ok", "deleted": key})
+    except Exception as e:
+        return web.json_response({"status": "error", "msg": str(e)})
+
 async def handle_task(request):
     if not check_secret(request):
         return web.json_response({"error": "unauthorized"}, status=401)
