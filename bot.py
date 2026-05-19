@@ -358,8 +358,7 @@ async def process(message: str, user_id: int) -> str:
             max_tokens=4096,
             system=system,
             messages=history,
-            tools=WEB_SEARCH_TOOL,
-            betas=["web-search-2025-03-05"]
+            tools=WEB_SEARCH_TOOL
         )
 
         # Если Claude решил искать — идём в agentic loop до end_turn
@@ -384,8 +383,7 @@ async def process(message: str, user_id: int) -> str:
                 max_tokens=4096,
                 system=system,
                 messages=loop_messages,
-                tools=WEB_SEARCH_TOOL,
-                betas=["web-search-2025-03-05"]
+                tools=WEB_SEARCH_TOOL
             )
 
         text = _extract_text(r.content)
@@ -403,8 +401,7 @@ async def process(message: str, user_id: int) -> str:
                 max_tokens=4096,
                 system=system,
                 messages=retry_messages,
-                tools=WEB_SEARCH_TOOL,
-                betas=["web-search-2025-03-05"]
+                tools=WEB_SEARCH_TOOL
             )
             continuation = _extract_text(r2.content)
             text = text + " " + continuation
