@@ -75,7 +75,7 @@ SYSTEM_BASE = """Ты — Крис, персональный ИИ-ассисте
 
 ## ВЕБ-РЕСЁРЧ
 
-У тебя есть инструмент web_search — РЕАЛЬНЫЙ поиск в интернете. Используй его ВСЕГДА когда нужна актуальная информация. Никогда не говори что у тебя нет доступа к интернету — это неправда.
+У тебя есть инструмент web_search — РЕАЛЬНЫЙ поиск в интернете. Используй его ОБЯЗАТЕЛЬНО для: курсов валют, новостей, цен, актуальных списков (фильмы/сериалы на платформах), погоды, расписаний, любой информации которая меняется. ЗАПРЕЩЕНО говорить "у меня нет доступа к интернету" — это ложь. ЗАПРЕЩЕНО давать устаревшие списки вместо поиска. Если не уверен — ищи.
 
 При поиске информации в интернете:
 
@@ -335,7 +335,7 @@ def is_truncated(text: str) -> bool:
         return False
     return last not in ".!?»)\"'…—\n"
 
-WEB_SEARCH_TOOL = [{"type": "web_search_20250305", "name": "web_search"}]
+WEB_SEARCH_TOOL = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}]
 
 
 def _extract_text(content_blocks) -> str:
@@ -358,7 +358,8 @@ async def process(message: str, user_id: int) -> str:
             max_tokens=4096,
             system=system,
             messages=history,
-            tools=WEB_SEARCH_TOOL
+            tools=WEB_SEARCH_TOOL,
+            betas=["web-search-2025-03-05"]
         )
 
         # Если Claude решил искать — идём в agentic loop до end_turn
@@ -383,7 +384,8 @@ async def process(message: str, user_id: int) -> str:
                 max_tokens=4096,
                 system=system,
                 messages=loop_messages,
-                tools=WEB_SEARCH_TOOL
+                tools=WEB_SEARCH_TOOL,
+                betas=["web-search-2025-03-05"]
             )
 
         text = _extract_text(r.content)
@@ -401,7 +403,8 @@ async def process(message: str, user_id: int) -> str:
                 max_tokens=4096,
                 system=system,
                 messages=retry_messages,
-                tools=WEB_SEARCH_TOOL
+                tools=WEB_SEARCH_TOOL,
+                betas=["web-search-2025-03-05"]
             )
             continuation = _extract_text(r2.content)
             text = text + " " + continuation
