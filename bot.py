@@ -5,6 +5,7 @@ from telegram.ext import Application, MessageHandler, MessageReactionHandler, Co
 import anthropic
 from anthropic import AsyncAnthropic
 import redis.asyncio as aioredis
+from ai_office_shared.shared.logging import log_event
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -350,6 +351,8 @@ def _extract_text(content_blocks) -> str:
 
 
 async def process(message: str, user_id: int) -> str:
+    await log_event(redis_client, BOT_NAME_LOWER, "message_received",
+                    user_id=user_id)
     history = await redis_get_history(user_id)
     history.append({"role": "user", "content": message})
     if len(history) > 20:
@@ -413,10 +416,14 @@ async def process(message: str, user_id: int) -> str:
 
         history.append({"role": "assistant", "content": text})
         await redis_save_history(user_id, history)
+        await log_event(redis_client, BOT_NAME_LOWER, "response_sent",
+                        user_id=user_id)
         return text
 
     except anthropic.APIError as e:
         logger.error(f"Anthropic API error: {e}")
+        await log_event(redis_client, BOT_NAME_LOWER, "api_error", level="error",
+                        user_id=user_id, error=str(e)[:200])
         return "⚠️ Что-то пошло не так с AI. Попробуй ещё раз."
     except Exception as e:
         logger.error(f"process() unexpected error: {e}")
@@ -524,6 +531,8 @@ async def handle_task(request):
         if not message:
             return web.json_response({"error": "empty message"}, status=400)
         await log("MSG_IN", message, from_=sender, to_=BOT_NAME)
+        await log_event(redis_client, BOT_NAME_LOWER, "task_received",
+                        user_id=user_id, via="http")
         response = await process(message, user_id)
         if data.get("notify", True):
             await send_to_group(f"Крис:\n{response}")
