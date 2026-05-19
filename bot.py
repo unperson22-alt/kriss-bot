@@ -574,7 +574,7 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Если owner передал user_id аргументом — сбрасываем того пользователя
     args = context.args
-    if caller_id == YOUR_TELEGRAM_ID and args:
+    if caller_id in ALLOWED_USERS and args:
         try:
             target_id = int(args[0])
         except:
@@ -590,8 +590,8 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Redis недоступен")
 
 async def cmd_reset_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /resetall — сброс истории ВСЕХ пользователей (только owner)"""
-    if update.effective_user.id != YOUR_TELEGRAM_ID:
+    """Команда /resetall — сброс истории ВСЕХ пользователей"""
+    if update.effective_user.id not in ALLOWED_USERS:
         return
     if redis_client:
         keys = []
