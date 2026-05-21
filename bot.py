@@ -1,11 +1,18 @@
 import os, logging, asyncio, httpx, json, base64
 from aiohttp import web
-from telegram import Update
-from telegram.ext import Application, MessageHandler, MessageReactionHandler, CommandHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import Application, MessageHandler, MessageReactionHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
 import anthropic
 from anthropic import AsyncAnthropic
 import redis.asyncio as aioredis
 from ai_office_shared.shared.logging import log_event
+from ai_office_shared.shared.redis_helpers import (
+    redis_get_history, redis_save_history,
+    redis_get_notes, redis_add_note,
+)
+from ai_office_shared.shared.tasks import (
+    auto_extract_interests, weekly_review_loop,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -106,101 +113,8 @@ LEARN_TRIGGERS = [
     "remember that", "note that", "always", "never"
 ]
 
-async def redis_get_history(user_id: int) -> list:
-    try:
-        raw = await redis_client.get(f"history:{BOT_NAME}:{user_id}")
-        return json.loads(raw) if raw else []
-    except Exception as e:
-        logger.warning(f"Redis get history failed: {e}")
-        return []
-
-async def redis_save_history(user_id: int, history: list):
-    try:
-        await redis_client.setex(
-            f"history:{BOT_NAME}:{user_id}",
-            604800,
-            json.dumps(history, ensure_ascii=False)
-        )
-    except Exception as e:
-        logger.warning(f"Redis save history failed: {e}")
-
-async def redis_get_notes(user_id: int) -> str:
-    try:
-        raw = await redis_client.get(f"notes:{BOT_NAME}:{user_id}")
-        return raw.decode() if raw else ""
-    except Exception as e:
-        logger.warning(f"Redis get notes failed: {e}")
-        return ""
-
-async def redis_add_note(user_id: int, note: str):
-    try:
-        existing = await redis_get_notes(user_id)
-        updated = (existing + "\n" + note).strip()
-        await redis_client.set(f"notes:{BOT_NAME}:{user_id}", updated)
-        logger.info(f"Note saved for {user_id}: {note}")
-    except Exception as e:
-        logger.warning(f"Redis add note failed: {e}")
-
-async def auto_extract_interests(message: str, user_id: int):
-    """Фоновое авто-извлечение фактов о пользователе через Haiku."""
-    try:
-        existing = await redis_get_notes(user_id)
-        r = claude.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=150,
-            system=(
-                "Ты извлекаешь факты о пользователе из его сообщений. "
-                "Найди конкретные факты, интересы, предпочтения или важные детали О ПОЛЬЗОВАТЕЛЕ. "
-                "Если нашёл что-то новое и конкретное — верни одну строку начинающуюся с [auto]. "
-                "Если ничего конкретного нет или это уже есть в заметках — верни пустую строку. "
-                "Не записывай временные состояния (устал, болит голова сегодня). "
-                "Только устойчивые факты: работа, семья, питание, хобби, предпочтения."
-            ),
-            messages=[{"role": "user", "content":
-                f"Сообщение: {message}\n\nУже известно:\n{existing or '(ничего)'}"}]
-        )
-        fact = r.content[0].text.strip()
-        if fact.startswith("[auto]"):
-            await redis_add_note(user_id, fact)
-            logger.info(f"Auto-extracted for {user_id}: {fact}")
-    except Exception as e:
-        logger.warning(f"auto_extract_interests failed: {e}")
-
-
-async def weekly_review(user_id: int):
-    """Еженедельный пересмотр профиля — компактизация заметок через Sonnet."""
-    try:
-        history = await redis_get_history(user_id)
-        notes = await redis_get_notes(user_id)
-        if not history and not notes:
-            return
-        history_text = "\n".join(
-            f"{m['role']}: {m['content'][:200]}" for m in history[-30:]
-        )
-        r = claude.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=400,
-            system=(
-                "Ты обновляешь профиль пользователя на основе переписки и старых заметок. "
-                "Создай компактный список фактов о пользователе (не более 10 строк). "
-                "Каждый факт с новой строки, начинается с [auto]. "
-                "Убери дубли, объедини похожее, удали устаревшее. "
-                "Только конкретные устойчивые факты."
-            ),
-            messages=[{"role": "user", "content":
-                f"Старые заметки:\n{notes or '(нет)'}\n\n"
-                f"Последние сообщения:\n{history_text}"}]
-        )
-        new_profile = r.content[0].text.strip()
-        await redis_client.set(f"notes:{BOT_NAME}:{user_id}", new_profile)
-        logger.info(f"Weekly review done for {user_id}")
-    except Exception as e:
-        logger.warning(f"weekly_review failed: {e}")
-
-
-
 async def build_system(user_id: int) -> str:
-    notes = await redis_get_notes(user_id)
+    notes = await redis_get_notes(redis_client, BOT_NAME_LOWER, user_id)
     if notes:
         return SYSTEM_BASE + f"\n\nЗаметки о пользователе:\n{notes}"
     return SYSTEM_BASE
@@ -260,7 +174,7 @@ async def generate_image(prompt: str) -> str | None:
 
 async def process_with_image(caption: str, user_id: int, image_b64: str, media_type: str = "image/jpeg") -> str:
     """Claude vision — анализ изображения. Ollama пропускается (не поддерживает vision)."""
-    history = await redis_get_history(user_id)
+    history = await redis_get_history(redis_client, BOT_NAME_LOWER, user_id)
     system = await build_system(user_id)
     try:
         r = claude.messages.create(
@@ -280,7 +194,7 @@ async def process_with_image(caption: str, user_id: int, image_b64: str, media_t
         history.append({"role": "assistant", "content": response})
         if len(history) > 20:
             history = history[-10:]
-        await redis_save_history(user_id, history)
+        await redis_save_history(redis_client, BOT_NAME_LOWER, user_id, history)
         return response
     except Exception as e:
         logger.error(f"process_with_image error: {e}")
@@ -353,7 +267,7 @@ def _extract_text(content_blocks) -> str:
 async def process(message: str, user_id: int) -> str:
     await log_event(redis_client, BOT_NAME_LOWER, "message_received",
                     user_id=user_id)
-    history = await redis_get_history(user_id)
+    history = await redis_get_history(redis_client, BOT_NAME_LOWER, user_id)
     history.append({"role": "user", "content": message})
     if len(history) > 20:
         history = history[-10:]
@@ -415,7 +329,7 @@ async def process(message: str, user_id: int) -> str:
             text = text + " " + continuation
 
         history.append({"role": "assistant", "content": text})
-        await redis_save_history(user_id, history)
+        await redis_save_history(redis_client, BOT_NAME_LOWER, user_id, history)
         await log_event(redis_client, BOT_NAME_LOWER, "response_sent",
                         user_id=user_id)
         return text
@@ -520,6 +434,96 @@ async def handle_reset_history(request: web.Request) -> web.Response:
     except Exception as e:
         return web.json_response({"status": "error", "msg": str(e)})
 
+# ── QUICK REPLY HELPERS ───────────────────────────────────────────────────────
+TASK_KEYWORDS = {
+    "задач", "сделать", "список", "план", "напомни", "не забудь",
+    "дедлайн", "срок", "статус", "готово", "выполнено", "успел",
+    "заметка", "запомни", "помни", "учти",
+}
+
+def should_show_quick_reply(response: str) -> bool:
+    """Показываем кнопки если ответ касается задач/планов/статусов."""
+    r = response.lower()
+    return any(kw in r for kw in TASK_KEYWORDS)
+
+def make_task_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📋 Задачи",  callback_data="qr_tasks"),
+            InlineKeyboardButton("🔄 Статус",  callback_data="qr_status"),
+        ],
+        [
+            InlineKeyboardButton("💬 Заметка", callback_data="qr_note"),
+            InlineKeyboardButton("✅ Готово",   callback_data="qr_done"),
+        ],
+    ])
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик Quick Reply кнопок."""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+
+    if query.data == "qr_tasks":
+        notes = await redis_get_notes(redis_client, BOT_NAME_LOWER, user_id)
+        if notes:
+            reply = await process("Покажи мой список задач и планов из заметок", user_id)
+        else:
+            reply = "У меня пока нет записей о твоих задачах. Напиши что нужно сделать — запомню."
+
+    elif query.data == "qr_status":
+        reply = await process("Дай краткий статус — что я делал, что запланировано, что в приоритете", user_id)
+
+    elif query.data == "qr_note":
+        reply = "Напиши что запомнить — я сохраню в заметки."
+
+    elif query.data == "qr_done":
+        reply = await process("Отмечаю последнее обсуждаемое как выполненное. Что следующее?", user_id)
+
+    else:
+        reply = "Хорошо."
+
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    sent = await context.bot.send_message(chat_id=query.message.chat_id, text=reply)
+    if sent:
+        await remember_my_message(sent.chat_id, sent.message_id)
+
+# ── SCHEDULED MESSAGES ────────────────────────────────────────────────────────
+async def handle_send_scheduled(request):
+    """
+    POST /send_scheduled — внешний триггер (Railway Cron) шлёт сообщение от Крисс.
+    Body: {"chat_id": int, "message": str, "user_id": int (optional)}
+    """
+    if not check_secret(request):
+        return web.json_response({"error": "unauthorized"}, status=401)
+    try:
+        data    = await request.json()
+        chat_id = data.get("chat_id")
+        message = data.get("message", "").strip()
+        user_id = data.get("user_id", YOUR_TELEGRAM_ID)
+        if not chat_id or not message:
+            return web.json_response({"error": "chat_id and message required"}, status=400)
+        bot = request.app["bot"]
+        # Генерируем через Claude если message — это инструкция а не готовый текст
+        if data.get("generate", False):
+            response = await process(message, user_id)
+            text = response
+        else:
+            text = message
+        sent = await bot.send_message(chat_id=int(chat_id), text=text)
+        if sent:
+            await remember_my_message(sent.chat_id, sent.message_id)
+        await log_event(redis_client, BOT_NAME_LOWER, "scheduled_sent",
+                        chat_id=chat_id, length=len(text))
+        return web.json_response({"status": "ok", "length": len(text)})
+    except Exception as e:
+        logger.error(f"/send_scheduled error: {e}")
+        return web.json_response({"error": str(e)}, status=500)
+
 async def handle_task(request):
     if not check_secret(request):
         return web.json_response({"error": "unauthorized"}, status=401)
@@ -550,11 +554,16 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Спрашивай что угодно, помогу с любыми задачами."
     )
 
-async def send_long(update: Update, text: str):
+async def send_long(update: Update, text: str, reply_markup=None):
     limit = 4000
+    sent = None
     while text:
-        chunk, text = text[:limit], text[limit:]
-        await update.message.reply_text(chunk)
+        chunk, rest = text[:limit], text[limit:]
+        kb = reply_markup if not rest else None
+        sent = await update.message.reply_text(chunk, reply_markup=kb)
+        text = rest
+    if sent:
+        await remember_my_message(sent.chat_id, sent.message_id)
 
 
 PHOTO_SEARCH_TRIGGERS = [
@@ -627,7 +636,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     if is_learn_trigger(msg):
-        await redis_add_note(user_id, msg)
+        await redis_add_note(redis_client, BOT_NAME_LOWER, user_id, msg)
 
     if wants_image(msg):
         await update.message.reply_text("🎨 Рисую, подожди...")
@@ -647,25 +656,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Если не нашли — идём в обычный process() который объяснит
 
     response = await process(msg, user_id)
-    asyncio.create_task(auto_extract_interests(msg, user_id))
+    asyncio.create_task(auto_extract_interests(redis_client, BOT_NAME_LOWER, user_id, msg, client))
     await log("MSG_OUT", f"{BOT_NAME}: {response}", from_=BOT_NAME, to_=user_name)
-    await send_long(update, response)
+    keyboard = make_task_keyboard() if should_show_quick_reply(response) else None
+    await send_long(update, response, reply_markup=keyboard)
 
 
-async def weekly_review_loop():
-    """Еженедельный пересмотр профилей всех пользователей (каждые 7 дней)."""
-    while True:
-        await asyncio.sleep(7 * 24 * 3600)
-        try:
-            keys = []
-            async for key in redis_client.scan_iter(f"history:{BOT_NAME}:*"):
-                keys.append(key)
-            for key in keys:
-                uid = int(key.decode().split(":")[-1])
-                await weekly_review(uid)
-            logger.info(f"weekly_review_loop done for {len(keys)} users")
-        except Exception as e:
-            logger.error(f"weekly_review_loop error: {e}")
+# weekly_review_loop → ai_office_shared.shared.tasks
+
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -746,13 +744,16 @@ async def main():
     logger.info("Redis connected")
 
     app_http = web.Application()
-    app_http.router.add_post("/task", handle_task)
+    app_http.router.add_post("/task",           handle_task)
+    app_http.router.add_post("/send_scheduled", handle_send_scheduled)
+    app_http.router.add_get("/health",          lambda r: web.json_response({"status":"ok","bot":"крисс"}))
     runner = web.AppRunner(app_http)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", HTTP_PORT).start()
     logger.info(f"HTTP on :{HTTP_PORT}")
 
     ptb = Application.builder().token(TELEGRAM_TOKEN).build()
+    app_http["bot"] = ptb.bot
     ptb.add_handler(CommandHandler("start", handle_start))
     ptb.add_handler(CommandHandler("reset", cmd_reset))
     ptb.add_handler(CommandHandler("resetall", cmd_reset_all))
@@ -760,11 +761,12 @@ async def main():
     ptb.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     ptb.add_handler(MessageReactionHandler(handle_reaction))
+    ptb.add_handler(CallbackQueryHandler(handle_callback))
     async with ptb:
         await ptb.start()
-        await ptb.updater.start_polling(drop_pending_updates=True, allowed_updates=["message", "edited_message", "message_reaction"])
+        await ptb.updater.start_polling(drop_pending_updates=True, allowed_updates=["message", "edited_message", "message_reaction", "callback_query"])
         logger.info("Крис запущен ✅")
-        asyncio.create_task(weekly_review_loop())
+        asyncio.create_task(weekly_review_loop(redis_client, BOT_NAME_LOWER, client))
         await asyncio.Event().wait()
 
 if __name__ == "__main__":
