@@ -766,7 +766,7 @@ async def main():
         await ptb.start()
         await ptb.updater.start_polling(drop_pending_updates=True, allowed_updates=["message", "edited_message", "message_reaction", "callback_query"])
         logger.info("Крис запущен ✅")
-        asyncio.create_task(weekly_review_loop(redis_client, BOT_NAME_LOWER, client))
+        asyncio.create_task(weekly_review_loop(redis_client, BOT_NAME_LOWER, claude_async))
         await asyncio.Event().wait()
 
 if __name__ == "__main__":
