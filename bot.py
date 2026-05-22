@@ -12,6 +12,9 @@ from ai_office_shared.shared.redis_helpers import (
 )
 from ai_office_shared.shared.tasks import (
     auto_extract_interests, weekly_review_loop,
+    schedule_loop, parse_schedule_tag,
+    add_scheduled_task, list_scheduled_tasks,
+    remove_scheduled_task, format_task_list,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -767,6 +770,7 @@ async def main():
         await ptb.updater.start_polling(drop_pending_updates=True, allowed_updates=["message", "edited_message", "message_reaction", "callback_query"])
         logger.info("Крис запущен ✅")
         asyncio.create_task(weekly_review_loop(redis_client, BOT_NAME_LOWER, claude_async))
+        asyncio.create_task(schedule_loop(redis_client, BOT_NAME_LOWER, ptb.bot))
         await asyncio.Event().wait()
 
 if __name__ == "__main__":
