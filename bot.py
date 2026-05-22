@@ -290,6 +290,9 @@ async def process(message: str, user_id: int) -> str:
     system = await build_system(user_id)
 
     try:
+        # web_search_20250305 — server-side tool.
+        # Anthropic API сам выполняет поиск и возвращает финальный ответ в одном вызове.
+        # Ручной agentic loop НЕ нужен и вызывал APIError (пустой tool_results=[]).
         r = await claude_async.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=4096,
@@ -297,31 +300,6 @@ async def process(message: str, user_id: int) -> str:
             messages=history,
             tools=WEB_SEARCH_TOOL
         )
-
-        # Если Claude решил искать — идём в agentic loop до end_turn
-        while r.stop_reason == "tool_use":
-            # Конвертируем content (list блоков) в формат для следующего хода
-            assistant_content = [b.model_dump() if hasattr(b, "model_dump") else b for b in r.content]
-            tool_results = []
-            for b in r.content:
-                if hasattr(b, "type") and b.type == "tool_use":
-                    # web_search — server-side tool, результат уже внутри блока
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": b.id,
-                        "content": getattr(b, "content", "") or ""
-                    })
-            loop_messages = history + [
-                {"role": "assistant", "content": assistant_content},
-                {"role": "user",      "content": tool_results}
-            ]
-            r = await claude_async.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=4096,
-                system=system,
-                messages=loop_messages,
-                tools=WEB_SEARCH_TOOL
-            )
 
         text = _extract_text(r.content)
         if not text:
@@ -803,4 +781,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
