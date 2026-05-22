@@ -289,51 +289,92 @@ async def process(message: str, user_id: int) -> str:
 
     system = await build_system(user_id)
 
-    try:
-        # web_search_20250305 — server-side tool.
-        # Anthropic API сам выполняет поиск и возвращает финальный ответ в одном вызове.
-        # Ручной agentic loop НЕ нужен и вызывал APIError (пустой tool_results=[]).
-        r = await claude_async.messages.create(
+    async def _call_claude(msgs):
+        """Один чистый вызов Claude с web_search (server-side tool — loop не нужен)."""
+        return await claude_async.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=4096,
             system=system,
-            messages=history,
+            messages=msgs,
             tools=WEB_SEARCH_TOOL
         )
 
+    try:
+        r = await _call_claude(history)
         text = _extract_text(r.content)
         if not text:
             text = "⚠️ Не получил ответ от AI. Попробуй ещё раз."
 
         if is_truncated(text):
-            logger.warning(f"Truncated response detected for {user_id}, retrying...")
-            retry_messages = history + [
+            logger.warning(f"Truncated response for {user_id}, retrying...")
+            r2 = await _call_claude(history + [
                 {"role": "assistant", "content": text},
                 {"role": "user",      "content": "Продолжи с того места где остановился."}
-            ]
-            r2 = await claude_async.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=4096,
-                system=system,
-                messages=retry_messages,
-                tools=WEB_SEARCH_TOOL
-            )
-            continuation = _extract_text(r2.content)
-            text = text + " " + continuation
+            ])
+            text = text + " " + _extract_text(r2.content)
 
         history.append({"role": "assistant", "content": text})
         await redis_save_history(redis_client, BOT_NAME_LOWER, user_id, history)
-        await log_event(redis_client, BOT_NAME_LOWER, "response_sent",
-                        user_id=user_id)
+        await log_event(redis_client, BOT_NAME_LOWER, "response_sent", user_id=user_id)
         return text
 
+    except anthropic.BadRequestError as e:
+        # 400 — чаще всего битая/несовместимая история в Redis.
+        # Сбрасываем и повторяем с чистого листа.
+        logger.error(f"BadRequestError user={user_id}: {e} | Resetting history and retrying.")
+        asyncio.create_task(report_bug(f"BadRequestError (history reset) user={user_id}", str(e)[:300]))
+        await redis_save_history(redis_client, BOT_NAME_LOWER, user_id, [])
+        try:
+            r = await _call_claude([{"role": "user", "content": message}])
+            text = _extract_text(r.content) or "⚠️ Не получил ответ от AI."
+            await redis_save_history(redis_client, BOT_NAME_LOWER, user_id,
+                                     [{"role": "user", "content": message},
+                                      {"role": "assistant", "content": text}])
+            return text
+        except Exception as e2:
+            logger.error(f"Retry after BadRequestError failed: {e2}")
+            return "⚠️ Что-то пошло не так с AI. Попробуй ещё раз."
+
+    except anthropic.AuthenticationError as e:
+        # 401 — невалидный ANTHROPIC_API_KEY
+        logger.error(f"AuthenticationError — API ключ невалиден! {e}")
+        asyncio.create_task(report_bug("AuthenticationError — ANTHROPIC_API_KEY невалиден!", str(e)[:200]))
+        return "⚠️ Ошибка аутентификации AI. Сообщаю администратору."
+
+    except anthropic.PermissionDeniedError as e:
+        # 403 — нет доступа к модели или фиче (web_search)
+        logger.error(f"PermissionDeniedError: {e}")
+        asyncio.create_task(report_bug("PermissionDeniedError — нет доступа к модели/фиче", str(e)[:200]))
+        return "⚠️ Нет доступа к AI. Попробуй позже."
+
+    except anthropic.NotFoundError as e:
+        # 404 — неверное имя модели
+        logger.error(f"NotFoundError — модель не найдена: {e}")
+        asyncio.create_task(report_bug("NotFoundError — неверное имя модели!", str(e)[:200]))
+        return "⚠️ Модель AI не найдена. Сообщаю администратору."
+
+    except anthropic.RateLimitError as e:
+        # 429 — превышен лимит запросов
+        logger.warning(f"RateLimitError user={user_id}: {e}")
+        return "⏳ Слишком много запросов. Попробуй через минуту."
+
+    except anthropic.InternalServerError as e:
+        # 5xx — проблема на стороне Anthropic
+        logger.error(f"InternalServerError (Anthropic side): {e}")
+        return "⚠️ Сервер AI временно недоступен. Попробуй через минуту."
+
     except anthropic.APIError as e:
-        logger.error(f"Anthropic API error: {e}")
+        # Всё остальное — неизвестная ошибка API
+        status = getattr(e, "status_code", "?")
+        logger.error(f"APIError status={status} user={user_id}: {e}")
         await log_event(redis_client, BOT_NAME_LOWER, "api_error", level="error",
                         user_id=user_id, error=str(e)[:200])
+        asyncio.create_task(report_bug(f"APIError status={status}", str(e)[:300]))
         return "⚠️ Что-то пошло не так с AI. Попробуй ещё раз."
+
     except Exception as e:
-        logger.error(f"process() unexpected error: {e}")
+        logger.error(f"process() unexpected error user={user_id}: {type(e).__name__}: {e}")
+        asyncio.create_task(report_bug(f"process() unexpected {type(e).__name__}", str(e)[:300]))
         return "⚠️ Внутренняя ошибка. Попробуй ещё раз."
 
 async def log(event: str, msg: str, from_: str = "", to_: str = ""):
