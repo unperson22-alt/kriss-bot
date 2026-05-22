@@ -1,3 +1,4 @@
+import re
 import os, logging, asyncio, httpx, json, base64
 from aiohttp import web
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
@@ -670,7 +671,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Если не нашли — идём в обычный process() который объяснит
 
     response = await process(msg, user_id)
-    asyncio.create_task(auto_extract_interests(redis_client, BOT_NAME_LOWER, user_id, msg, client))
+    asyncio.create_task(auto_extract_interests(redis_client, BOT_NAME_LOWER, user_id, msg, claude_async))
+
+    # Обработка тегов шедулера
+    tag = parse_schedule_tag(response)
+    if tag:
+        if tag["action"] == "add":
+            await add_scheduled_task(redis_client, BOT_NAME_LOWER, user_id, tag)
+        elif tag["action"] == "cancel":
+            await remove_scheduled_task(redis_client, BOT_NAME_LOWER, user_id, tag["index"])
+        elif tag["action"] == "list":
+            tasks = await list_scheduled_tasks(redis_client, BOT_NAME_LOWER, user_id)
+            task_text = await format_task_list(tasks)
+            await send_long(update, task_text)
+            return
+        # Убираем тег из текста перед отправкой
+        response = re.sub(r'\[(?:SCHEDULE|CANCEL_SCHEDULE|LIST_SCHEDULES)[^\]]*\]', '', response).strip()
+
     await log("MSG_OUT", f"{BOT_NAME}: {response}", from_=BOT_NAME, to_=user_name)
     keyboard = make_task_keyboard() if should_show_quick_reply(response) else None
     await send_long(update, response, reply_markup=keyboard)
