@@ -3,5 +3,5 @@ anthropic
 aiohttp
 httpx
 redis>=4.2.0
-ai-office-shared @ git+https://github.com/unperson22-alt/ai-office-shared.git@v0.1.2
+ai-office-shared @ git+https://github.com/unperson22-alt/ai-office-shared.git@caab743f600a5e7fbde2bfad0b5d9f1c1edae3b2
 
