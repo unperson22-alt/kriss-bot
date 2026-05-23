@@ -661,12 +661,55 @@ async def find_and_send_photo(update, query: str) -> bool:
         logger.warning(f"find_and_send_photo failed: {e}")
         return False
 
+
+async def analyze_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, bot_name: str, system_prompt: str) -> None:
+    """Анализирует фото через Claude Vision и спрашивает чем помочь."""
+    msg = update.message
+    caption = msg.caption or ""
+    await context.bot.send_chat_action(msg.chat_id, "typing")
+    try:
+        photo = msg.photo[-1]
+        file_obj = await context.bot.get_file(photo.file_id)
+        tg_token = context.bot.token
+        fp = file_obj.file_path or ""
+        photo_url = fp if fp.startswith("http") else ("https://api.telegram.org/file/bot" + tg_token + "/" + fp)
+        import httpx as _httpx, base64 as _b64
+        async with _httpx.AsyncClient(timeout=15) as c:
+            img_r = await c.get(photo_url)
+            img_b64 = _b64.b64encode(img_r.content).decode()
+        prompt = (
+            "Пользователь прислал тебе фото" +
+            (". Подпись: " + caption if caption else " без подписи") +
+            ". Кратко опиши что видишь (1-2 предложения) и спроси чем можешь помочь."
+        )
+        import anthropic as _ant
+        _client = _ant.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        resp = await asyncio.to_thread(
+            _client.messages.create,
+            model="claude-haiku-4-5-20251001",
+            max_tokens=300,
+            system=system_prompt,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
+                    {"type": "text", "text": prompt}
+                ]
+            }]
+        )
+        await msg.reply_text(resp.content[0].text)
+    except Exception as e:
+        await msg.reply_text("Хм, не смог прочитать это фото. Опиши текстом.")
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ALLOWED_USERS:
         return
     if update.effective_chat.type in ["group", "supergroup"]:
         return
 
+    if update.message and update.message.photo:
+        await analyze_photo(update, context, BOT_NAME, SYSTEM_PROMPT)
+        return
     msg       = update.message.text
     user_id   = update.effective_user.id
     user_name = update.effective_user.first_name or update.effective_user.username or str(user_id)
