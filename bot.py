@@ -489,6 +489,7 @@ def make_task_keyboard() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("💬 Заметка", callback_data="qr_note"),
             InlineKeyboardButton("✅ Готово",   callback_data="qr_done"),
+            InlineKeyboardButton("💡 Запросить функцию", callback_data="qr_feature"),
         ],
     ])
 
@@ -513,6 +514,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif query.data == "qr_done":
         reply = await process("Отмечаю последнее обсуждаемое как выполненное. Что следующее?", user_id)
+
+    elif query.data == "qr_feature":
+        context.user_data["pending_feature"] = True
+        reply = "Опиши функцию которой не хватает — одним сообщением. Я сразу отправлю Владу."
 
     else:
         reply = "Хорошо."
@@ -688,6 +693,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await log("MSG_OUT", f"{BOT_NAME}: [фото по запросу]", from_=BOT_NAME, to_=user_name)
             return
         # Если не нашли — идём в обычный process() который объяснит
+
+    # ── Feature request ──────────────────────────────────────────────────────
+    if context.user_data.get("pending_feature"):
+        context.user_data.pop("pending_feature", None)
+        sender_name = update.effective_user.first_name or update.effective_user.username or str(user_id)
+        feature_text = "💡 Запрос функции для Крисс\n\nОт: " + sender_name + "\nОписание: " + msg
+        try:
+            await context.bot.send_message(chat_id=391077101, text=feature_text)
+            response = "✅ Отправил Владу! Он рассмотрит."
+        except Exception as fe:
+            response = "⚠️ Не смог отправить: " + str(fe)
+        await send_long(update, response)
+        return
+    # ─────────────────────────────────────────────────────────────────────────
 
     response = await process(msg, user_id)
     asyncio.create_task(auto_extract_interests(redis_client, BOT_NAME_LOWER, user_id, msg, claude_async))
