@@ -18,6 +18,52 @@ from ai_office_shared.shared.tasks import (
     remove_scheduled_task, format_task_list,
 )
 
+
+# ── Office agents ─────────────────────────────────────────────────────────────
+
+OFFICE_AGENTS = {
+    "ТИЛЛИ": {"url": "https://tilly-bot-production.up.railway.app",
+               "desc": "веб-поиск, актуальные данные, новости"},
+    "МИЛЛИ": {"url": "https://milly-bot-production.up.railway.app",
+               "desc": "бизнес, монетизация, стратегия"},
+    "СИЛЛИ": {"url": "https://cilly-bot-production.up.railway.app",
+               "desc": "код, автоматизация, технические задачи"},
+    "ДОКТОР":{"url": "https://dilly-bot-production.up.railway.app",
+               "desc": "здоровье, медицинские советы"},
+    "БИЛЛИ": {"url": "https://billy-bot-production.up.railway.app",
+               "desc": "мотивация, жизненные решения"},
+}
+
+async def _enhance_prompt(text: str, client) -> str:
+    try:
+        r = await client.messages.create(
+            model="claude-haiku-4-5-20251001", max_tokens=200,
+            system="Улучши запрос пользователя — чётче и конкретнее. Верни ТОЛЬКО улучшенный запрос.",
+            messages=[{"role": "user", "content": text}]
+        )
+        enhanced = r.content[0].text.strip() if r.content else ""
+        return enhanced if enhanced and len(enhanced) > 5 else text
+    except Exception:
+        return text
+
+async def _call_office(agent_name: str, message: str, user_id: int) -> str:
+    info = OFFICE_AGENTS.get(agent_name.upper())
+    if not info: return ""
+    try:
+        async with httpx.AsyncClient(timeout=25) as c:
+            r = await c.post(f"{info['url']}/task",
+                json={"message": message, "user_id": user_id})
+        if r.status_code == 200:
+            return r.json().get("response", "")
+    except Exception as e:
+        logger.warning(f"[office] {agent_name}: {e}")
+    return ""
+
+def _parse_office_tag(text: str):
+    import re as _re
+    m = _re.search(r'\[OFFICE:(\w+):(.+?)\]', text)
+    return (m.group(1).upper(), m.group(2).strip()) if m else (None, None)
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -300,6 +346,7 @@ def _extract_text(content_blocks) -> str:
 
 
 async def process(message: str, user_id: int) -> str:
+    message = await _enhance_prompt(message, claude_async)
     await log_event(redis_client, BOT_NAME_LOWER, "message_received",
                     user_id=user_id)
     history = await redis_get_history(redis_client, BOT_NAME_LOWER, user_id)
