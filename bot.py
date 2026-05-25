@@ -88,6 +88,20 @@ def _call_llm(_client, **kwargs):
     return _client.messages.create(**kwargs)
 redis_client: aioredis.Redis = None
 
+
+KRISS_HELP = """Вот что я умею 🤖
+
+Персональный ассистент:
+— Отвечаю на любые вопросы — объясняю, советую, помогаю
+— Веб-поиск в реальном времени — курсы, новости, цены, расписания
+— Напоминания и регулярные задачи — просто попроси
+— Генерирую изображения по описанию
+
+AI-офис за спиной:
+— При необходимости привлекаю специализированных агентов
+— Маркетинг, контент, аналитика, трейдинг — всё доступно
+
+И многое другое — просто напиши что нужно 🙂"""
 SYSTEM_BASE = """Ты — Крис, персональный ИИ-ассистент. Помогаешь с любыми вопросами: отвечаешь, объясняешь, советуешь, помогаешь с задачами. За твоей спиной — AI-офис со специализированными агентами, которых ты можешь привлекать при необходимости. Общаешься неформально, по делу. Язык — адаптируй под пользователя (пишет по-украински — отвечай по-украински, по-русски — по-русски). ВАЖНО: держи один язык на протяжении ВСЕГО ответа. Не переключайся на другой язык посреди ответа даже если результаты веб-поиска пришли на другом языке — переводи их на язык пользователя. Не используй Markdown-разметку (##, **, таблицы, ---) — пиши простым текстом, для структуры используй цифры, тире и символ •.
 
 ## ВЕБ-РЕСЁРЧ
@@ -585,12 +599,26 @@ async def handle_task(request):
         logger.error(f"/task error: {e}")
         return web.json_response({"error": str(e)}, status=500)
 
+async def handle_kriss_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id not in ALLOWED_USERS:
+        await query.answer(); return
+    await query.answer()
+    await query.message.reply_text(KRISS_HELP)
+
+
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ALLOWED_USERS:
         return
+    from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("❓ Что умею?", callback_data="kriss_help")
+    ]])
     await update.message.reply_text(
-        "Привет! Я Крис — твой персональный ассистент. "
-        "Спрашивай что угодно, помогу с любыми задачами."
+        "Привет! Я Крис — твой персональный ассистент.\n"
+        "Помогаю с любыми задачами — и не только.\n\n"
+        "Нажми ❓ чтобы узнать что умею, или просто пиши 👇",
+        reply_markup=kb
     )
 
 async def send_long(update: Update, text: str, reply_markup=None):
@@ -867,6 +895,7 @@ async def main():
     ptb = Application.builder().token(TELEGRAM_TOKEN).build()
     app_http["bot"] = ptb.bot
     ptb.add_handler(CommandHandler("start", handle_start))
+    ptb.add_handler(CallbackQueryHandler(handle_kriss_help, pattern="^kriss_help$"))
     ptb.add_handler(CommandHandler("reset", cmd_reset))
     ptb.add_handler(CommandHandler("resetall", cmd_reset_all))
     ptb.add_handler(MessageHandler(filters.PHOTO, handle_photo))
