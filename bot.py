@@ -135,7 +135,13 @@ SYSTEM_BASE = """Ты — Крис, персональный ИИ-ассисте
 • Показать список → [LIST_SCHEDULES]
 • Отменить #N → [CANCEL_SCHEDULE:N]
 Время всегда в UTC. Если пользователь называет локальное время — переведи в UTC (Германия: UTC+2 летом, UTC+1 зимой).
-Отвечай пользователю обычным текстом — подтверди что напоминание создано, укажи когда сработает."""
+Отвечай пользователю обычным текстом — подтверди что напоминание создано, укажи когда сработает.
+
+== ОФИСНЫЕ АГЕНТЫ ==
+
+У тебя есть доступ к специалистам AI-офиса. Когда нужны их возможности — добавь в конец ответа тег [OFFICE:ИМЯ:запрос].
+ТИЛЛИ — поиск, МИЛЛИ — бизнес, СИЛЛИ — код, ДОКТОР — здоровье, БИЛЛИ — мотивация.
+Используй только когда реально нужно. Один тег."""
 
 LEARN_TRIGGERS = [
     "запомни", "учти", "отныне", "имей в виду", "на будущее",
@@ -326,6 +332,25 @@ async def process(message: str, user_id: int) -> str:
                 {"role": "user",      "content": "Продолжи с того места где остановился."}
             ])
             text = text + " " + _extract_text(r2.content)
+
+        # Офисный агент если Claude запросил
+        import re as _re
+        agent_name, office_query = _parse_office_tag(text)
+        clean_text = _re.sub(r'\[OFFICE:[^\]]+\]', '', text).strip()
+        if agent_name and office_query:
+            office_result = await _call_office(agent_name, office_query, user_id)
+            if office_result:
+                synthesis = history + [
+                    {"role": "assistant", "content": clean_text},
+                    {"role": "user", "content": f"[Данные от {agent_name}]: {office_result}\n\nСинтезируй финальный ответ."}
+                ]
+                r2 = await _call_claude(synthesis)
+                final = _extract_text(r2.content)
+                text = final if final else clean_text + f"\n\n📡 {agent_name}: {office_result[:300]}"
+            else:
+                text = clean_text
+        else:
+            text = clean_text
 
         history.append({"role": "assistant", "content": text})
         await redis_save_history(redis_client, BOT_NAME_LOWER, user_id, history)
