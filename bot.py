@@ -75,7 +75,7 @@ LOG_BOT_URL      = os.environ.get("LOG_BOT_URL", "")
 BUG_CHAT_ID      = os.environ.get("BUG_CHAT_ID", "-5197140411")
 REDIS_URL        = os.environ.get("REDIS_URL", "redis://localhost:6379")
 HTTP_SECRET      = os.environ.get("HTTP_SECRET", "")
-HTTP_PORT        = 8080
+HTTP_PORT        = int(os.environ.get("PORT", 8080))
 BOT_NAME         = "Крис"
 BOT_NAME_LOWER   = "крисс"  # Redis ключ для /metrics (явный override)
 
