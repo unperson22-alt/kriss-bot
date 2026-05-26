@@ -12,12 +12,12 @@ from ai_office_shared.shared.redis_helpers import (
     redis_get_notes, redis_add_note,
 )
 from ai_office_shared.shared.tasks import (
-from ai_office_shared.shared.ollama import OllamaResult as _OllamaResult, try_ollama as _try_ollama
     auto_extract_interests, weekly_review_loop,
     schedule_loop, parse_schedule_tag,
     add_scheduled_task, list_scheduled_tasks,
     remove_scheduled_task, format_task_list,
 )
+from ai_office_shared.shared.ollama import OllamaResult as _OllamaResult, try_ollama as _try_ollama
 
 
 # ── Office agents ─────────────────────────────────────────────────────────────
