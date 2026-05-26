@@ -648,7 +648,10 @@ async def handle_kriss_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.from_user.id not in ALLOWED_USERS:
         await query.answer(); return
     await query.answer()
-    await query.message.reply_text(KRISS_HELP)
+    if is_routed(data):
+        return web.json_response({"status": "ok", "response": response})
+    else:
+        await query.message.reply_text(KRISS_HELP)
 
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
