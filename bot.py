@@ -930,10 +930,29 @@ async def main():
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=False)
     logger.info("Redis connected")
 
+
+async def handle_reply(request):
+    try:
+        data       = await request.json()
+        chat_id    = data.get("chat_id")
+        text       = data.get("text", "")
+        from_agent = data.get("from_agent", "")
+        if not chat_id or not text:
+            return web.Response(status=400, text="chat_id and text required")
+        prefix = f"[{from_agent}] " if from_agent else ""
+        from telegram import Bot as _TGBot
+        _tg = _TGBot(token=TELEGRAM_TOKEN)
+        await _tg.send_message(chat_id=int(chat_id), text=prefix + text)
+        return web.Response(text="ok")
+    except Exception as e:
+        logger.error(f"[КРИСС] /reply error: {e}")
+        return web.Response(status=500, text=str(e))
+
     app_http = web.Application()
     app_http.router.add_post("/task",           handle_task)
     app_http.router.add_post("/send_scheduled", handle_send_scheduled)
     app_http.router.add_get("/health",          lambda r: web.json_response({"status":"ok","bot":"крисс"}))
+    app_http.router.add_post("/reply",          handle_reply)
     runner = web.AppRunner(app_http)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", HTTP_PORT).start()
