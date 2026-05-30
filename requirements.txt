@@ -4,3 +4,4 @@ aiohttp
 httpx
 redis>=4.2.0
 ai-office-shared @ git+https://github.com/unperson22-alt/ai-office-shared.git@v0.1.12
+# trigger redeploy
