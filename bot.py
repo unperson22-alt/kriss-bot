@@ -925,12 +925,6 @@ async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.warning(f"quality hincrby failed: {e}")
 
 
-async def main():
-    global redis_client
-    redis_client = aioredis.from_url(REDIS_URL, decode_responses=False)
-    logger.info("Redis connected")
-
-
 async def handle_reply(request):
     try:
         data       = await request.json()
@@ -947,6 +941,12 @@ async def handle_reply(request):
     except Exception as e:
         logger.error(f"[КРИСС] /reply error: {e}")
         return web.Response(status=500, text=str(e))
+
+
+async def main():
+    global redis_client
+    redis_client = aioredis.from_url(REDIS_URL, decode_responses=False)
+    logger.info("Redis connected")
 
     app_http = web.Application()
     app_http.router.add_post("/task",           handle_task)
