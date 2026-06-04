@@ -943,6 +943,27 @@ async def handle_reply(request):
         return web.Response(status=500, text=str(e))
 
 
+
+
+BOT_REPLY_CHANCE = 0.2  # шанс ответить на сообщение бота в группе
+
+async def handle_group_bot_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Реагирует на сообщения ботов в группе с шансом 20%."""
+    if not update.message or not update.message.text:
+        return
+    sender = update.effective_user
+    if not sender or not sender.is_bot:
+        return
+    if update.effective_chat.type not in ["group", "supergroup"]:
+        return
+    if random.random() >= BOT_REPLY_CHANCE:
+        return
+    msg = update.message.text
+    user_id = sender.id
+    response = await process(msg, user_id)
+    if response:
+        await update.message.reply_text(response)
+
 async def main():
     global redis_client
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=False)
@@ -965,6 +986,7 @@ async def main():
     ptb.add_handler(CommandHandler("reset", cmd_reset))
     ptb.add_handler(CommandHandler("resetall", cmd_reset_all))
     ptb.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    ptb.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS, handle_group_bot_message))
     ptb.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     ptb.add_handler(MessageReactionHandler(handle_reaction))
