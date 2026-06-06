@@ -37,6 +37,8 @@ OFFICE_AGENTS = {
 }
 
 async def _enhance_prompt(text: str, client) -> str:
+    if len(text) > 400:
+        return text  # длинный текст уже конкретный — не трогаем
     try:
         r = await client.messages.create(
             model="claude-haiku-4-5-20251001", max_tokens=200,
