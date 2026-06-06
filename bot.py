@@ -40,7 +40,7 @@ async def _enhance_prompt(text: str, client) -> str:
     try:
         r = await client.messages.create(
             model="claude-haiku-4-5-20251001", max_tokens=200,
-            system="Улучши запрос пользователя — чётче и конкретнее. Верни ТОЛЬКО улучшенный запрос.",
+            system="Улучши запрос пользователя — чётче и конкретнее. Если это приветствие, короткий ответ или фраза без смысловой нагрузки (например: привет, ок, да, нет, спасибо, понял) — верни текст ДОСЛОВНО без изменений. Верни ТОЛЬКО результат.",
             messages=[{"role": "user", "content": text}]
         )
         enhanced = r.content[0].text.strip() if r.content else ""
