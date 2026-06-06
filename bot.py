@@ -945,6 +945,41 @@ async def handle_reply(request):
 
 
 
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Транскрибирует голосовое через Groq Whisper и отвечает как на текст."""
+    msg = update.message
+    if not msg: return
+    uid = update.effective_user.id
+    await context.bot.send_chat_action(msg.chat_id, "typing")
+    groq_key = os.environ.get("GROQ_API_KEY", "")
+    if not groq_key:
+        await msg.reply_text("GROQ_API_KEY не настроен 🔑"); return
+    try:
+        import httpx as _hx, base64 as _b64
+        file_obj = await context.bot.get_file(msg.voice.file_id)
+        fp = file_obj.file_path or ""
+        url = fp if fp.startswith("http") else f"https://api.telegram.org/file/bot{context.bot.token}/{fp}"
+        async with _hx.AsyncClient(timeout=15) as c:
+            audio_data = (await c.get(url)).content
+        async with _hx.AsyncClient(timeout=30) as c:
+            resp = await c.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {groq_key}"},
+                files={"file": ("voice.ogg", audio_data, "audio/ogg")},
+                data={"model": "whisper-large-v3", "language": "ru"},
+            )
+            resp.raise_for_status()
+            transcription = resp.json().get("text", "").strip()
+        if not transcription:
+            await msg.reply_text("Не удалось распознать голос 🤷"); return
+        reply = await process(transcription, uid)
+        if reply:
+            await msg.reply_text(reply)
+    except Exception as e:
+        logger.error(f"[КРИСС voice] {e}")
+        await msg.reply_text("Ошибка обработки голоса 🙈")
+
 BOT_REPLY_CHANCE = 0.2  # шанс ответить на сообщение бота в группе
 
 async def handle_group_bot_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -986,6 +1021,7 @@ async def main():
     ptb.add_handler(CommandHandler("reset", cmd_reset))
     ptb.add_handler(CommandHandler("resetall", cmd_reset_all))
     ptb.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    ptb.add_handler(MessageHandler(filters.VOICE, handle_voice))
     ptb.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS, handle_group_bot_message))
     ptb.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
