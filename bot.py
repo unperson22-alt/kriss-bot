@@ -19,22 +19,15 @@ from ai_office_shared.shared.tasks import (
 )
 from ai_office_shared.shared.ollama import OllamaResult as _OllamaResult, try_ollama as _try_ollama
 from ai_office_shared.shared.routing import forward_to_filly, make_reply_handler, is_routed
+from ai_office_shared.shared.web_search import WEB_SEARCH_TOOLS as WEB_SEARCH_TOOL
+from ai_office_shared.shared.office import (
+    OFFICE_AGENTS, call_office as _call_office_shared, parse_office_tag as _parse_office_tag
+)
 
 
-# ── Office agents ─────────────────────────────────────────────────────────────
+async def _call_office(agent_name: str, message: str, user_id: int) -> str:
+    return await _call_office_shared(agent_name, message, user_id)
 
-OFFICE_AGENTS = {
-    "ТИЛЛИ": {"url": "https://tilly-bot-production.up.railway.app",
-               "desc": "веб-поиск, актуальные данные, новости"},
-    "МИЛЛИ": {"url": "https://milly-bot-production.up.railway.app",
-               "desc": "бизнес, монетизация, стратегия"},
-    "СИЛЛИ": {"url": "https://cilly-bot-production.up.railway.app",
-               "desc": "код, автоматизация, технические задачи"},
-    "ДОКТОР":{"url": "https://dilly-bot-production.up.railway.app",
-               "desc": "здоровье, медицинские советы"},
-    "БИЛЛИ": {"url": "https://billy-bot-production.up.railway.app",
-               "desc": "мотивация, жизненные решения"},
-}
 
 async def _enhance_prompt(text: str, client) -> str:
     if len(text) > 400:
@@ -63,10 +56,7 @@ async def _call_office(agent_name: str, message: str, user_id: int) -> str:
         logger.warning(f"[office] {agent_name}: {e}")
     return ""
 
-def _parse_office_tag(text: str):
-    import re as _re
-    m = _re.search(r'\[OFFICE:(\w+):(.+?)\]', text)
-    return (m.group(1).upper(), m.group(2).strip()) if m else (None, None)
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -309,8 +299,6 @@ def is_truncated(text: str) -> bool:
     if ord(last) > 127:
         return False
     return last not in ".!?»)\"'…—\n"
-
-WEB_SEARCH_TOOL = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}]
 
 
 def _extract_text(content_blocks) -> str:
