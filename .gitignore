@@ -1,0 +1,4 @@
+# Secrets — не коммитим
+.env
+.env.*
+!.env.example
