@@ -159,10 +159,13 @@ LEARN_TRIGGERS = [
 ]
 
 async def build_system(user_id: int) -> str:
+    from ai_office_shared.shared.office import instructions_suffix
     notes = await redis_get_notes(redis_client, BOT_NAME_LOWER, user_id)
+    result = SYSTEM_BASE
     if notes:
-        return SYSTEM_BASE + f"\n\nЗаметки о пользователе:\n{notes}"
-    return SYSTEM_BASE
+        result += f"\n\nЗаметки о пользователе:\n{notes}"
+    result += await instructions_suffix(redis_client, BOT_NAME_LOWER)
+    return result
 
 
 IMAGE_TRIGGERS = [
