@@ -19,43 +19,17 @@ from ai_office_shared.shared.tasks import (
 )
 from ai_office_shared.shared.ollama import OllamaResult as _OllamaResult, try_ollama as _try_ollama
 from ai_office_shared.shared.routing import forward_to_filly, make_reply_handler, is_routed
+from ai_office_shared.shared.auth import office_auth_middleware
 from ai_office_shared.shared.web_search import WEB_SEARCH_TOOLS as WEB_SEARCH_TOOL
 from ai_office_shared.shared.office import (
     OFFICE_AGENTS, call_office as _call_office_shared, parse_office_tag as _parse_office_tag
 )
+from ai_office_shared.shared.prompt import enhance_prompt
+from ai_office_shared.shared.models import MODEL_SONNET, MODEL_HAIKU
 
 
 async def _call_office(agent_name: str, message: str, user_id: int) -> str:
     return await _call_office_shared(agent_name, message, user_id)
-
-
-async def _enhance_prompt(text: str, client) -> str:
-    if len(text) > 400:
-        return text  # длинный текст уже конкретный — не трогаем
-    try:
-        r = await client.messages.create(
-            model="claude-haiku-4-5-20251001", max_tokens=200,
-            system="Улучши запрос пользователя — чётче и конкретнее. Если это приветствие, короткий ответ или фраза без смысловой нагрузки (например: привет, ок, да, нет, спасибо, понял) — верни текст ДОСЛОВНО без изменений. Верни ТОЛЬКО результат.",
-            messages=[{"role": "user", "content": text}]
-        )
-        enhanced = r.content[0].text.strip() if r.content else ""
-        return enhanced if enhanced and len(enhanced) > 5 else text
-    except Exception:
-        return text
-
-async def _call_office(agent_name: str, message: str, user_id: int) -> str:
-    info = OFFICE_AGENTS.get(agent_name.upper())
-    if not info: return ""
-    try:
-        async with httpx.AsyncClient(timeout=25) as c:
-            r = await c.post(f"{info['url']}/task",
-                json={"message": message, "user_id": user_id})
-        if r.status_code == 200:
-            return r.json().get("response", "")
-    except Exception as e:
-        logger.warning(f"[office] {agent_name}: {e}")
-    return ""
-
 
 
 logging.basicConfig(level=logging.INFO)
@@ -226,7 +200,7 @@ async def process_with_image(caption: str, user_id: int, image_b64: str, media_t
     system = await build_system(user_id)
     try:
         r = claude.messages.create(
-            model="claude-sonnet-4-6",
+            model=MODEL_SONNET,
             max_tokens=2048,
             system=system,
             messages=history + [{
@@ -311,7 +285,7 @@ def _extract_text(content_blocks) -> str:
 
 
 async def process(message: str, user_id: int) -> str:
-    message = await _enhance_prompt(message, claude_async)
+    message = await enhance_prompt(message, claude_async)
     await log_event(redis_client, BOT_NAME_LOWER, "message_received",
                     user_id=user_id)
     history = await redis_get_history(redis_client, BOT_NAME_LOWER, user_id)
@@ -324,7 +298,7 @@ async def process(message: str, user_id: int) -> str:
     async def _call_claude(msgs):
         """Один чистый вызов Claude с web_search (server-side tool — loop не нужен)."""
         return await claude_async.messages.create(
-            model="claude-sonnet-4-6",
+            model=MODEL_SONNET,
             max_tokens=4096,
             system=system,
             messages=msgs,
@@ -701,7 +675,7 @@ async def find_and_send_photo(update, query: str) -> bool:
             # Bing Image Search через web_search API не доступен напрямую
             # Используем Anthropic web_search чтобы найти прямой URL картинки
             r = await claude_async.messages.create(
-                model="claude-sonnet-4-6",
+                model=MODEL_SONNET,
                 max_tokens=200,
                 system="Ты помощник. Найди прямую ссылку на изображение (заканчивается на .jpg, .jpeg, .png, .gif, .webp) по запросу пользователя. Верни ТОЛЬКО прямой URL картинки, без объяснений. Если не можешь найти — верни слово NONE.",
                 messages=[{"role": "user", "content": f"Найди прямую ссылку на картинку: {query}"}],
@@ -754,7 +728,7 @@ async def analyze_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, bot_
         _client = _ant.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
         resp = await asyncio.to_thread(
             _client.messages.create,
-            model="claude-haiku-4-5-20251001",
+            model=MODEL_HAIKU,
             max_tokens=300,
             system=system_prompt,
             messages=[{
@@ -997,7 +971,7 @@ async def main():
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=False)
     logger.info("Redis connected")
 
-    app_http = web.Application()
+    app_http = web.Application(middlewares=[office_auth_middleware])
     app_http.router.add_post("/task",           handle_task)
     app_http.router.add_post("/send_scheduled", handle_send_scheduled)
     app_http.router.add_get("/health",          lambda r: web.json_response({"status":"ok","bot":"крисс"}))
