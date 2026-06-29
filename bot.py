@@ -19,6 +19,7 @@ from ai_office_shared.shared.tasks import (
 )
 from ai_office_shared.shared.ollama import OllamaResult as _OllamaResult, try_ollama as _try_ollama
 from ai_office_shared.shared.routing import forward_to_filly, make_reply_handler, is_routed
+from ai_office_shared.shared.auth import office_auth_middleware
 from ai_office_shared.shared.web_search import WEB_SEARCH_TOOLS as WEB_SEARCH_TOOL
 from ai_office_shared.shared.office import (
     OFFICE_AGENTS, call_office as _call_office_shared, parse_office_tag as _parse_office_tag
@@ -970,7 +971,7 @@ async def main():
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=False)
     logger.info("Redis connected")
 
-    app_http = web.Application()
+    app_http = web.Application(middlewares=[office_auth_middleware])
     app_http.router.add_post("/task",           handle_task)
     app_http.router.add_post("/send_scheduled", handle_send_scheduled)
     app_http.router.add_get("/health",          lambda r: web.json_response({"status":"ok","bot":"крисс"}))
