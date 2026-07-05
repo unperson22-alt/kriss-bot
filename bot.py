@@ -1,5 +1,5 @@
 import re
-import os, logging, asyncio, httpx, json, base64
+import os, logging, asyncio, httpx, json, base64, random
 from aiohttp import web
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, MessageHandler, MessageReactionHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
@@ -615,10 +615,7 @@ async def handle_kriss_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.from_user.id not in ALLOWED_USERS:
         await query.answer(); return
     await query.answer()
-    if is_routed(data):
-        return web.json_response({"status": "ok", "response": response})
-    else:
-        await query.message.reply_text(KRISS_HELP)
+    await query.message.reply_text(KRISS_HELP)
 
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -750,7 +747,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if update.message and update.message.photo:
-        await analyze_photo(update, context, BOT_NAME, SYSTEM_PROMPT)
+        await analyze_photo(update, context, BOT_NAME, SYSTEM_BASE)
         return
     msg       = update.message.text
     user_id   = update.effective_user.id
