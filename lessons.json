@@ -1,28 +1,18 @@
-
-
-```python
-# Bug Lesson #44: Крисс обвинял пользователя в копировании текста при приветствии
-# ================================================================================
-#
-# Симптом: Пользователь писал "Кріс, привіт", а бот обвинял в копировании текста
-#
-# Root Cause Chain:
-# 1. _enhance_prompt применялся ко ВСЕМ сообщениям без исключения
-# 2. Haiku получал фатическое приветствие "Кріс, привіт" с промптом "улучши запрос"
-# 3. Haiku не понимал контекст и генерировал шаблонный/формальный текст вместо приветствия
-# 4. Основной Claude получал уже enhanced-версию (шаблонный текст) вместо оригинала
-# 5. Claude видел явно сгенерированный текст и справедливо (для него) обвинял пользователя
-#    в копировании — потому что текст действительно был сгенерирован (Haiku), но не пользователем
-#
-# Фикс: Добавлена инструкция в system prompt _enhance_prompt:
-#   "Если фраза является фатической коммуникацией (приветствие, прощание, благодарность,
-#    короткая реакция) — верни её без изменений. Не пытайся улучшить то, что не является запросом."
-#
-# Урок: Промежуточные LLM-трансформации могут исказить intent пользователя.
-#        Не каждое сообщение — это "запрос", который нужно "улучшать".
-#        Фатическая коммуникация (phatic communication) — это социальный сигнал, не информационный.
-#
-# Дата: 2025-01-XX
-# Severity: HIGH (бот оскорблял пользователей при приветствии)
-# Category: prompt-pipeline, intermediate-llm, phatic-communication
-```
+[
+  {
+    "date": "2025-01-XX",
+    "issue": "User wrote a greeting ('Kris, pryvit') and the bot accused them of copying/pasting text",
+    "root_cause": "_enhance_prompt was applied to ALL messages without exception; Haiku rewrote the phatic greeting into template-looking text, the main Claude received that enhanced version instead of the original and (fairly, from its view) accused the user of copying — the text WAS generated, but by Haiku, not the user",
+    "solution": "Added an instruction to the _enhance_prompt system prompt: if the phrase is phatic communication (greeting, farewell, thanks, short reaction) — return it unchanged; do not 'improve' what is not a query",
+    "preventive_measure": "Intermediate LLM transformations can distort user intent; not every message is a 'query' to enhance — phatic communication is a social signal, not an informational one",
+    "severity": "HIGH (bot insulted users on greetings)",
+    "category": "prompt-pipeline, intermediate-llm, phatic-communication"
+  },
+  {
+    "date": "2026-07-10",
+    "issue": "Kris's photo-reply text appeared truncated (~80 chars, cut mid-word) in the Telegram log group, while the recipient received the full message",
+    "root_cause": "MSG_OUT log emit in the photo handler sliced the reply to 80 chars (f\"{BOT_NAME}: {response[:80]}\" at bot.py:259) — a legacy pattern from BOT_TEMPLATE in ai-office-shared/agents/coder.py; the delivery path (send_long) was never truncated, so only the log copy was cut",
+    "solution": "Removed the [:80] slice so MSG_OUT logs the full reply, matching the text and HTTP handlers; the same fix applied fleet-wide (villy-bot, prophet-bot, pilly-bot-bot, railway-deployer-bot) and to BOT_TEMPLATE itself; logger-bot's central MAX_MSG_LEN=3800 guard with the explicit '… [обрезано]' marker remains the single truncation point",
+    "preventive_measure": "Log emitters must not pre-truncate — length limiting is owned solely by logger-bot; BOT_TEMPLATE no longer stamps [:80] into newly generated bots"
+  }
+]

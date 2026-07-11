@@ -256,7 +256,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         image_b64 = base64.b64encode(bytes(file_bytes)).decode()
         response = await process_with_image(caption, user_id, image_b64)
         await log("MSG_IN", f"[фото] {caption}", from_=user_name, to_=BOT_NAME)
-        await log("MSG_OUT", f"{BOT_NAME}: {response[:80]}", from_=BOT_NAME, to_=user_name)
+        await log("MSG_OUT", f"{BOT_NAME}: {response}", from_=BOT_NAME, to_=user_name)
         await send_long(update, response)
     except Exception as e:
         logger.error(f"handle_photo error: {e}")
