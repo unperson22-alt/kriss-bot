@@ -248,6 +248,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_name = update.effective_user.first_name or str(user_id)
     caption = update.message.caption or "Что на этом фото?"
 
+    await log("MSG_IN", f"[фото] {caption}", from_=user_name, to_=BOT_NAME)
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     try:
         photo = update.message.photo[-1]
@@ -255,7 +256,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_bytes = await file.download_as_bytearray()
         image_b64 = base64.b64encode(bytes(file_bytes)).decode()
         response = await process_with_image(caption, user_id, image_b64)
-        await log("MSG_IN", f"[фото] {caption}", from_=user_name, to_=BOT_NAME)
         await log("MSG_OUT", f"{BOT_NAME}: {response}", from_=BOT_NAME, to_=user_name)
         await send_long(update, response)
     except Exception as e:
