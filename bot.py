@@ -18,7 +18,6 @@ from ai_office_shared.shared.tasks import (
     remove_scheduled_task, format_task_list,
 )
 from ai_office_shared.shared.ollama import OllamaResult as _OllamaResult, try_ollama as _try_ollama
-from ai_office_shared.shared.routing import forward_to_filly, make_reply_handler, is_routed
 from ai_office_shared.shared.auth import office_auth_middleware
 from ai_office_shared.shared.web_search import WEB_SEARCH_TOOLS as WEB_SEARCH_TOOL
 from ai_office_shared.shared.office import (
@@ -615,10 +614,7 @@ async def handle_kriss_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.from_user.id not in ALLOWED_USERS:
         await query.answer(); return
     await query.answer()
-    if is_routed(data):
-        return web.json_response({"status": "ok", "response": response})
-    else:
-        await query.message.reply_text(KRISS_HELP)
+    await query.message.reply_text(KRISS_HELP)
 
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
