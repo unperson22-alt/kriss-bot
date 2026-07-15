@@ -1,5 +1,5 @@
 import re
-import os, logging, asyncio, httpx, json, base64
+import os, logging, asyncio, httpx, json, base64, random
 from aiohttp import web
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, MessageHandler, MessageReactionHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
@@ -746,7 +746,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if update.message and update.message.photo:
-        await analyze_photo(update, context, BOT_NAME, SYSTEM_PROMPT)
+        await analyze_photo(update, context, BOT_NAME, SYSTEM_BASE)
         return
     msg       = update.message.text
     user_id   = update.effective_user.id
