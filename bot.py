@@ -1,5 +1,5 @@
 import re
-import os, logging, asyncio, httpx, json, base64
+import os, logging, asyncio, httpx, json, random
 from aiohttp import web
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, MessageHandler, MessageReactionHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
@@ -12,10 +12,17 @@ from ai_office_shared.shared.redis_helpers import (
     redis_get_notes, redis_add_note,
 )
 from ai_office_shared.shared.tasks import (
-    auto_extract_interests, weekly_review_loop,
+    auto_extract_interests, weekly_review, weekly_review_loop,
     schedule_loop, parse_schedule_tag,
     add_scheduled_task, list_scheduled_tasks,
-    remove_scheduled_task, format_task_list,
+    remove_scheduled_task, format_task_list, spawn,
+)
+from ai_office_shared.shared.media import (
+    IMAGE_FILTER, ImageError, addressed_in_group, bot_username, extract_image,
+)
+from ai_office_shared.shared.dev_escalation import (
+    DEV_FEATURE_PROMPT_BLOCK, parse_dev_feature_tag,
+    request_dev_feature, strip_dev_feature_tag,
 )
 from ai_office_shared.shared.ollama import OllamaResult as _OllamaResult, try_ollama as _try_ollama
 from ai_office_shared.shared.auth import office_auth_middleware
@@ -23,8 +30,8 @@ from ai_office_shared.shared.web_search import WEB_SEARCH_TOOLS as WEB_SEARCH_TO
 from ai_office_shared.shared.office import (
     OFFICE_AGENTS, call_office as _call_office_shared, parse_office_tag as _parse_office_tag
 )
-from ai_office_shared.shared.prompt import enhance_prompt
-from ai_office_shared.shared.models import MODEL_SONNET, MODEL_HAIKU
+from ai_office_shared.shared.prompt import enhance_prompt_ex, intent_hint
+from ai_office_shared.shared.models import MODEL_SONNET
 
 
 async def _call_office(agent_name: str, message: str, user_id: int) -> str:
@@ -124,7 +131,7 @@ SYSTEM_BASE = """Ты — Крис, персональный ИИ-ассисте
 
 У тебя есть доступ к специалистам AI-офиса. Когда нужны их возможности — добавь в конец ответа тег [OFFICE:ИМЯ:запрос].
 ТИЛЛИ — поиск, МИЛЛИ — бизнес, СИЛЛИ — код, ДОКТОР — здоровье, БИЛЛИ — мотивация.
-Используй только когда реально нужно. Один тег."""
+Используй только когда реально нужно. Один тег.""" + DEV_FEATURE_PROMPT_BLOCK
 
 LEARN_TRIGGERS = [
     "запомни", "учти", "отныне", "имей в виду", "на будущее",
@@ -237,29 +244,54 @@ async def report_bug(description: str, error: str = ""):
     except Exception as e:
         logger.error(f"report_bug failed: {e}")
 
+
+async def notify_owner(text: str) -> None:
+    """Уведомление владельцу. Fail-silent — задача на доске уже создана."""
+    try:
+        async with httpx.AsyncClient() as c:
+            await c.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                json={"chat_id": YOUR_TELEGRAM_ID, "text": text}, timeout=10
+            )
+    except Exception as e:
+        logger.error(f"notify_owner failed: {e}")
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Картинки: фотографией И файлом (Document.IMAGE), в ЛС и в группе.
+
+    До 2026-07-25 хендлер ловил только filters.PHOTO и делал голый `return` на группе —
+    картинка файлом пропадала везде, а картинка в группе пропадала молча.
+    Теперь единственный «тихий» случай — фото в группе, адресованное не боту.
+    """
     if update.effective_user.id not in ALLOWED_USERS:
         return
-    if update.effective_chat.type in ["group", "supergroup"]:
+
+    is_group = update.effective_chat.type in ["group", "supergroup"]
+    if is_group and not addressed_in_group(
+        update.message, bot_username(context.bot), BOT_NAME
+    ):
         return
 
     user_id = update.effective_user.id
     user_name = update.effective_user.first_name or str(user_id)
-    caption = update.message.caption or "Что на этом фото?"
 
+    img = await extract_image(update.message, context.bot)
+    if isinstance(img, ImageError):
+        logger.warning("handle_photo rejected image: %s", img.reason)
+        await update.message.reply_text(img.user_message)
+        return
+
+    caption = img.caption or "Что на этом фото?"
     await log("MSG_IN", f"[фото] {caption}", from_=user_name, to_=BOT_NAME)
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     try:
-        photo = update.message.photo[-1]
-        file = await context.bot.get_file(photo.file_id)
-        file_bytes = await file.download_as_bytearray()
-        image_b64 = base64.b64encode(bytes(file_bytes)).decode()
-        response = await process_with_image(caption, user_id, image_b64)
+        response = await process_with_image(caption, user_id, img.b64, img.media_type)
         await log("MSG_OUT", f"{BOT_NAME}: {response}", from_=BOT_NAME, to_=user_name)
         await send_long(update, response)
     except Exception as e:
         logger.error(f"handle_photo error: {e}")
-        asyncio.create_task(report_bug("handle_photo crashed", str(e)))
+        spawn(report_bug("handle_photo crashed", str(e)), name="report_bug")
         await update.message.reply_text("⚠️ Не смог обработать фото. Попробуй ещё раз.")
 
 
@@ -284,7 +316,13 @@ def _extract_text(content_blocks) -> str:
 
 
 async def process(message: str, user_id: int) -> str:
-    message = await enhance_prompt(message, claude_async)
+    # ВАЖНО: в историю идёт ОРИГИНАЛ пользователя, а не вывод enhance-модели.
+    # Раньше здесь было `message = await enhance_prompt(...)` — главная модель никогда
+    # не видела слов пользователя и на украинском/коротком входе принимала Haiku-артефакт
+    # за чужой текст («система сама собі поставила запитання», 2026-07-25).
+    enh = await enhance_prompt_ex(
+        message, claude_async, redis_client=redis_client, bot_name=BOT_NAME_LOWER,
+    )
     await log_event(redis_client, BOT_NAME_LOWER, "message_received",
                     user_id=user_id)
     history = await redis_get_history(redis_client, BOT_NAME_LOWER, user_id)
@@ -292,7 +330,8 @@ async def process(message: str, user_id: int) -> str:
     if len(history) > 20:
         history = history[-10:]
 
-    system = await build_system(user_id)
+    # Уточнение — вторично и живёт в системном промпте, а не в реплике пользователя.
+    system = await build_system(user_id) + intent_hint(enh)
 
     async def _call_claude(msgs):
         """Один чистый вызов Claude с web_search (server-side tool — loop не нужен)."""
@@ -346,7 +385,7 @@ async def process(message: str, user_id: int) -> str:
         # 400 — чаще всего битая/несовместимая история в Redis.
         # Сбрасываем и повторяем с чистого листа.
         logger.error(f"BadRequestError user={user_id}: {e} | Resetting history and retrying.")
-        asyncio.create_task(report_bug(f"BadRequestError (history reset) user={user_id}", str(e)[:300]))
+        spawn(report_bug(f"BadRequestError (history reset) user={user_id}", str(e)[:300]))
         await redis_save_history(redis_client, BOT_NAME_LOWER, user_id, [])
         try:
             r = await _call_claude([{"role": "user", "content": message}])
@@ -362,19 +401,19 @@ async def process(message: str, user_id: int) -> str:
     except anthropic.AuthenticationError as e:
         # 401 — невалидный ANTHROPIC_API_KEY
         logger.error(f"AuthenticationError — API ключ невалиден! {e}")
-        asyncio.create_task(report_bug("AuthenticationError — ANTHROPIC_API_KEY невалиден!", str(e)[:200]))
+        spawn(report_bug("AuthenticationError — ANTHROPIC_API_KEY невалиден!", str(e)[:200]))
         return "⚠️ Ошибка аутентификации AI. Сообщаю администратору."
 
     except anthropic.PermissionDeniedError as e:
         # 403 — нет доступа к модели или фиче (web_search)
         logger.error(f"PermissionDeniedError: {e}")
-        asyncio.create_task(report_bug("PermissionDeniedError — нет доступа к модели/фиче", str(e)[:200]))
+        spawn(report_bug("PermissionDeniedError — нет доступа к модели/фиче", str(e)[:200]))
         return "⚠️ Нет доступа к AI. Попробуй позже."
 
     except anthropic.NotFoundError as e:
         # 404 — неверное имя модели
         logger.error(f"NotFoundError — модель не найдена: {e}")
-        asyncio.create_task(report_bug("NotFoundError — неверное имя модели!", str(e)[:200]))
+        spawn(report_bug("NotFoundError — неверное имя модели!", str(e)[:200]))
         return "⚠️ Модель AI не найдена. Сообщаю администратору."
 
     except anthropic.RateLimitError as e:
@@ -393,12 +432,12 @@ async def process(message: str, user_id: int) -> str:
         logger.error(f"APIError status={status} user={user_id}: {e}")
         await log_event(redis_client, BOT_NAME_LOWER, "api_error", level="error",
                         user_id=user_id, error=str(e)[:200])
-        asyncio.create_task(report_bug(f"APIError status={status}", str(e)[:300]))
+        spawn(report_bug(f"APIError status={status}", str(e)[:300]))
         return "⚠️ Что-то пошло не так с AI. Попробуй ещё раз."
 
     except Exception as e:
         logger.error(f"process() unexpected error user={user_id}: {type(e).__name__}: {e}")
-        asyncio.create_task(report_bug(f"process() unexpected {type(e).__name__}", str(e)[:300]))
+        spawn(report_bug(f"process() unexpected {type(e).__name__}", str(e)[:300]))
         return "⚠️ Внутренняя ошибка. Попробуй ещё раз."
 
 async def log(event: str, msg: str, from_: str = "", to_: str = ""):
@@ -463,7 +502,7 @@ async def handle_weekly_review(request):
             keys.append(key)
         for key in keys:
             uid = int(key.decode().split(":")[-1])
-            await weekly_review(uid)
+            await weekly_review(redis_client, BOT_NAME_LOWER, uid, claude_async)
         return web.json_response({"status": "ok", "users": len(keys)})
     except Exception as e:
         logger.error(f"/cron/weekly_review error: {e}")
@@ -700,54 +739,12 @@ async def find_and_send_photo(update, query: str) -> bool:
         return False
 
 
-async def analyze_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, bot_name: str, system_prompt: str) -> None:
-    """Анализирует фото через Claude Vision и спрашивает чем помочь."""
-    msg = update.message
-    caption = msg.caption or ""
-    await context.bot.send_chat_action(msg.chat_id, "typing")
-    try:
-        photo = msg.photo[-1]
-        file_obj = await context.bot.get_file(photo.file_id)
-        tg_token = context.bot.token
-        fp = file_obj.file_path or ""
-        photo_url = fp if fp.startswith("http") else ("https://api.telegram.org/file/bot" + tg_token + "/" + fp)
-        import httpx as _httpx, base64 as _b64
-        async with _httpx.AsyncClient(timeout=15) as c:
-            img_r = await c.get(photo_url)
-            img_b64 = _b64.b64encode(img_r.content).decode()
-        prompt = (
-            "Пользователь прислал тебе фото" +
-            (". Подпись: " + caption if caption else " без подписи") +
-            ". Кратко опиши что видишь (1-2 предложения) и спроси чем можешь помочь."
-        )
-        import anthropic as _ant
-        _client = _ant.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
-        resp = await asyncio.to_thread(
-            _client.messages.create,
-            model=MODEL_HAIKU,
-            max_tokens=300,
-            system=system_prompt,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
-                    {"type": "text", "text": prompt}
-                ]
-            }]
-        )
-        await msg.reply_text(resp.content[0].text)
-    except Exception as e:
-        await msg.reply_text("Хм, не смог прочитать это фото. Опиши текстом.")
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ALLOWED_USERS:
         return
     if update.effective_chat.type in ["group", "supergroup"]:
         return
 
-    if update.message and update.message.photo:
-        await analyze_photo(update, context, BOT_NAME, SYSTEM_PROMPT)
-        return
     msg       = update.message.text
     user_id   = update.effective_user.id
     user_name = update.effective_user.first_name or update.effective_user.username or str(user_id)
@@ -776,21 +773,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Если не нашли — идём в обычный process() который объяснит
 
     # ── Feature request ──────────────────────────────────────────────────────
+    # Раньше уходило простым сообщением в личку мимо доски задач и терялось.
+    # Теперь — задача на канонический taskboard (assignee=dev-dept) + уведомление.
     if context.user_data.get("pending_feature"):
         context.user_data.pop("pending_feature", None)
-        sender_name = update.effective_user.first_name or update.effective_user.username or str(user_id)
-        feature_text = "💡 Запрос функции для Крисс\n\nОт: " + sender_name + "\nОписание: " + msg
-        try:
-            await context.bot.send_message(chat_id=391077101, text=feature_text)
-            response = "✅ Отправил Владу! Он рассмотрит."
-        except Exception as fe:
-            response = "⚠️ Не смог отправить: " + str(fe)
+        task_id = await request_dev_feature(
+            redis_client, BOT_NAME, user_name, msg, notify=notify_owner,
+        )
+        response = (
+            f"✅ Передал в отдел разработки (задача {task_id})."
+            if task_id else
+            "✅ Передал Владу. На доску задач записать не смог — Redis недоступен."
+        )
         await send_long(update, response)
         return
     # ─────────────────────────────────────────────────────────────────────────
 
     response = await process(msg, user_id)
-    asyncio.create_task(auto_extract_interests(redis_client, BOT_NAME_LOWER, user_id, msg, claude_async))
+    spawn(auto_extract_interests(redis_client, BOT_NAME_LOWER, user_id, msg, claude_async),
+          name="auto_extract_interests")
 
     # Обработка тегов шедулера
     tag = parse_schedule_tag(response)
@@ -806,6 +807,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         # Убираем тег из текста перед отправкой
         response = re.sub(r'\[(?:SCHEDULE|CANCEL_SCHEDULE|LIST_SCHEDULES)[^\]]*\]', '', response).strip()
+
+    # Бот упёрся в отсутствие возможности → задача в dev-dept, а не отписка юзеру.
+    feature = parse_dev_feature_tag(response)
+    if feature:
+        response = strip_dev_feature_tag(response)
+        await request_dev_feature(
+            redis_client, BOT_NAME, user_name, feature, notify=notify_owner,
+        )
 
     await log("MSG_OUT", f"{BOT_NAME}: {response}", from_=BOT_NAME, to_=user_name)
     keyboard = make_task_keyboard() if should_show_quick_reply(response) else None
@@ -983,7 +992,8 @@ async def main():
     ptb.add_handler(CallbackQueryHandler(handle_kriss_help, pattern="^kriss_help$"))
     ptb.add_handler(CommandHandler("reset", cmd_reset))
     ptb.add_handler(CommandHandler("resetall", cmd_reset_all))
-    ptb.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    # IMAGE_FILTER = PHOTO | Document.IMAGE — картинка файлом раньше не ловилась вовсе.
+    ptb.add_handler(MessageHandler(IMAGE_FILTER, handle_photo))
     ptb.add_handler(MessageHandler(filters.VOICE, handle_voice))
     ptb.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS, handle_group_bot_message))
     ptb.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
@@ -994,8 +1004,10 @@ async def main():
         await ptb.start()
         await ptb.updater.start_polling(drop_pending_updates=True, allowed_updates=["message", "edited_message", "message_reaction", "callback_query"])
         logger.info("Крис запущен ✅")
-        asyncio.create_task(weekly_review_loop(redis_client, BOT_NAME_LOWER, claude_async))
-        asyncio.create_task(schedule_loop(redis_client, BOT_NAME_LOWER, ptb.bot))
+        # spawn() удерживает ссылку: голый create_task позволял GC собрать цикл.
+        spawn(weekly_review_loop(redis_client, BOT_NAME_LOWER, claude_async),
+              name="weekly_review_loop")
+        spawn(schedule_loop(redis_client, BOT_NAME_LOWER, ptb.bot), name="schedule_loop")
         await asyncio.Event().wait()
 
 if __name__ == "__main__":
