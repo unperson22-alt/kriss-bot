@@ -1,5 +1,4 @@
-import re
-import os, logging, asyncio, httpx, json, random
+import os, re, logging, asyncio, httpx, random
 from aiohttp import web
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, MessageHandler, MessageReactionHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
@@ -12,10 +11,8 @@ from ai_office_shared.shared.redis_helpers import (
     redis_get_notes, redis_add_note,
 )
 from ai_office_shared.shared.tasks import (
-    auto_extract_interests, weekly_review, weekly_review_loop,
-    schedule_loop, parse_schedule_tag,
-    add_scheduled_task, list_scheduled_tasks,
-    remove_scheduled_task, format_task_list, spawn,
+    SCHEDULE_PROMPT_BLOCK, apply_schedule_tag, auto_extract_interests,
+    schedule_loop, spawn, weekly_review, weekly_review_loop,
 )
 from ai_office_shared.shared.media import (
     IMAGE_FILTER, ImageError, addressed_in_group, bot_username, extract_image,
@@ -24,11 +21,11 @@ from ai_office_shared.shared.dev_escalation import (
     DEV_FEATURE_PROMPT_BLOCK, parse_dev_feature_tag,
     request_dev_feature, strip_dev_feature_tag,
 )
-from ai_office_shared.shared.ollama import OllamaResult as _OllamaResult, try_ollama as _try_ollama
+from ai_office_shared.shared.ollama import try_ollama as _try_ollama
 from ai_office_shared.shared.auth import office_auth_middleware
 from ai_office_shared.shared.web_search import WEB_SEARCH_TOOLS as WEB_SEARCH_TOOL
 from ai_office_shared.shared.office import (
-    OFFICE_AGENTS, call_office as _call_office_shared, parse_office_tag as _parse_office_tag
+    call_office as _call_office_shared, parse_office_tag as _parse_office_tag
 )
 from ai_office_shared.shared.prompt import enhance_prompt_ex, intent_hint
 from ai_office_shared.shared.models import MODEL_SONNET
@@ -116,22 +113,11 @@ SYSTEM_BASE = """Ты — Крис, персональный ИИ-ассисте
 
 Нельзя: давать устаревшее без предупреждения, выбирать один источник при конфликте без объяснения, подавать непроверенное как факт.
 
-УПРАВЛЕНИЕ НАПОМИНАНИЯМИ:
-Если пользователь просит создать напоминание или регулярное сообщение — добавь в конец своего ответа специальный тег (он невидим для пользователя):
-• Каждый день в HH:MM UTC → [SCHEDULE:daily:HH:MM:текст]
-• Каждую неделю в день → [SCHEDULE:weekly:mon:HH:MM:текст] (mon/tue/wed/thu/fri/sat/sun)
-• Каждые N минут → [SCHEDULE:interval:Nm:текст]
-• Один раз в дату → [SCHEDULE:once:YYYY-MM-DD:HH:MM:текст]
-• Показать список → [LIST_SCHEDULES]
-• Отменить #N → [CANCEL_SCHEDULE:N]
-Время всегда в UTC. Если пользователь называет локальное время — переведи в UTC (Германия: UTC+2 летом, UTC+1 зимой).
-Отвечай пользователю обычным текстом — подтверди что напоминание создано, укажи когда сработает.
-
 == ОФИСНЫЕ АГЕНТЫ ==
 
 У тебя есть доступ к специалистам AI-офиса. Когда нужны их возможности — добавь в конец ответа тег [OFFICE:ИМЯ:запрос].
 ТИЛЛИ — поиск, МИЛЛИ — бизнес, СИЛЛИ — код, ДОКТОР — здоровье, БИЛЛИ — мотивация.
-Используй только когда реально нужно. Один тег.""" + DEV_FEATURE_PROMPT_BLOCK
+Используй только когда реально нужно. Один тег.""" + SCHEDULE_PROMPT_BLOCK + DEV_FEATURE_PROMPT_BLOCK
 
 LEARN_TRIGGERS = [
     "запомни", "учти", "отныне", "имей в виду", "на будущее",
@@ -704,36 +690,24 @@ def wants_photo_search(text: str) -> bool:
 
 async def find_and_send_photo(update, query: str) -> bool:
     """Ищет фото через web_search и отправляет в чат. Возвращает True если успешно."""
-    import re
     try:
-        async with httpx.AsyncClient(timeout=15) as c:
-            # Bing Image Search через web_search API не доступен напрямую
-            # Используем Anthropic web_search чтобы найти прямой URL картинки
-            r = await claude_async.messages.create(
-                model=MODEL_SONNET,
-                max_tokens=200,
-                system="Ты помощник. Найди прямую ссылку на изображение (заканчивается на .jpg, .jpeg, .png, .gif, .webp) по запросу пользователя. Верни ТОЛЬКО прямой URL картинки, без объяснений. Если не можешь найти — верни слово NONE.",
-                messages=[{"role": "user", "content": f"Найди прямую ссылку на картинку: {query}"}],
-                tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}]
-            )
-            texts = [b.text for b in r.content if hasattr(b, "text") and b.text]
-            url = " ".join(texts).strip()
-            
-            if not url or url == "NONE" or len(url) < 10:
-                return False
-            
-            # Извлекаем URL если есть лишний текст
-            urls = re.findall(r'https?://\S+\.(?:jpg|jpeg|png|gif|webp)\S*', url, re.IGNORECASE)
-            if not urls:
-                # Попробуем любой https URL
-                urls = re.findall(r'https?://\S+', url)
-            
-            if not urls:
-                return False
-            
-            photo_url = urls[0].rstrip('.,)')
-            await update.message.reply_photo(photo=photo_url)
-            return True
+        # httpx-клиент здесь не нужен: поиск идёт server-side инструментом Anthropic.
+        r = await claude_async.messages.create(
+            model=MODEL_SONNET,
+            max_tokens=200,
+            system="Ты помощник. Найди прямую ссылку на изображение (заканчивается на .jpg, .jpeg, .png, .gif, .webp) по запросу пользователя. Верни ТОЛЬКО прямой URL картинки, без объяснений. Если не можешь найти — верни слово NONE.",
+            messages=[{"role": "user", "content": f"Найди прямую ссылку на картинку: {query}"}],
+            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
+        )
+        text = " ".join(b.text for b in r.content if hasattr(b, "text") and b.text).strip()
+        if not text or text == "NONE" or len(text) < 10:
+            return False
+        urls = (re.findall(r'https?://\S+\.(?:jpg|jpeg|png|gif|webp)\S*', text, re.IGNORECASE)
+                or re.findall(r'https?://\S+', text))
+        if not urls:
+            return False
+        await update.message.reply_photo(photo=urls[0].rstrip('.,)'))
+        return True
     except Exception as e:
         logger.warning(f"find_and_send_photo failed: {e}")
         return False
@@ -793,20 +767,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     spawn(auto_extract_interests(redis_client, BOT_NAME_LOWER, user_id, msg, claude_async),
           name="auto_extract_interests")
 
-    # Обработка тегов шедулера
-    tag = parse_schedule_tag(response)
-    if tag:
-        if tag["action"] == "add":
-            await add_scheduled_task(redis_client, BOT_NAME_LOWER, user_id, tag)
-        elif tag["action"] == "cancel":
-            await remove_scheduled_task(redis_client, BOT_NAME_LOWER, user_id, tag["index"])
-        elif tag["action"] == "list":
-            tasks = await list_scheduled_tasks(redis_client, BOT_NAME_LOWER, user_id)
-            task_text = await format_task_list(tasks)
-            await send_long(update, task_text)
-            return
-        # Убираем тег из текста перед отправкой
-        response = re.sub(r'\[(?:SCHEDULE|CANCEL_SCHEDULE|LIST_SCHEDULES)[^\]]*\]', '', response).strip()
+    # Напоминания из разговора (развязка тега — в shared, одна на все боты)
+    response, listing = await apply_schedule_tag(redis_client, BOT_NAME_LOWER, user_id, response)
+    if listing:
+        await send_long(update, listing)
+        return
 
     # Бот упёрся в отсутствие возможности → задача в dev-dept, а не отписка юзеру.
     feature = parse_dev_feature_tag(response)
@@ -928,7 +893,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not groq_key:
         await msg.reply_text("GROQ_API_KEY не настроен 🔑"); return
     try:
-        import httpx as _hx, base64 as _b64
+        import httpx as _hx
         file_obj = await context.bot.get_file(msg.voice.file_id)
         fp = file_obj.file_path or ""
         url = fp if fp.startswith("http") else f"https://api.telegram.org/file/bot{context.bot.token}/{fp}"

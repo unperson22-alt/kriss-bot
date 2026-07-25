@@ -1,0 +1,23 @@
+# Гейт против класса багов, который 25.07.2026 дал 30 живых крашей в проде
+# (lessons #74–76). py_compile разбирает код, но НЕ резолвит имена — он пропускал
+# SYSTEM_PROMPT при определённой SYSTEM, ptb вне main(), незаимпортированный random.
+# pyflakes ловит это за секунды.
+name: lint
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pyflakes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pyflakes
+      - name: compile
+        run: python -m compileall -q $(git ls-files '*.py')
+      - name: pyflakes
+        run: python -m pyflakes $(git ls-files '*.py')
