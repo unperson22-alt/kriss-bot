@@ -18,7 +18,7 @@ from ai_office_shared.shared.tasks import (
     remove_scheduled_task, format_task_list, spawn,
 )
 from ai_office_shared.shared.media import (
-    IMAGE_FILTER, ImageError, addressed_in_group, extract_image,
+    IMAGE_FILTER, ImageError, addressed_in_group, bot_username, extract_image,
 )
 from ai_office_shared.shared.dev_escalation import (
     DEV_FEATURE_PROMPT_BLOCK, parse_dev_feature_tag,
@@ -269,7 +269,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     is_group = update.effective_chat.type in ["group", "supergroup"]
     if is_group and not addressed_in_group(
-        update.message, getattr(context.bot, "username", "") or "", BOT_NAME
+        update.message, bot_username(context.bot), BOT_NAME
     ):
         return
 
