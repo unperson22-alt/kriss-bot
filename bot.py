@@ -22,7 +22,9 @@ from ai_office_shared.shared.dev_escalation import (
     request_dev_feature, strip_dev_feature_tag,
 )
 from ai_office_shared.shared.ollama import try_ollama as _try_ollama
-from ai_office_shared.shared.auth import office_auth_middleware
+from ai_office_shared.shared.auth import (
+    deny_message, note_denied_access, office_auth_middleware,
+)
 from ai_office_shared.shared.web_search import WEB_SEARCH_TOOLS as WEB_SEARCH_TOOL
 from ai_office_shared.shared.office import (
     call_office as _call_office_shared, parse_office_tag as _parse_office_tag
@@ -659,7 +661,14 @@ async def handle_kriss_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ALLOWED_USERS:
+    u = update.effective_user
+    if u.id not in ALLOWED_USERS:
+        # Раньше здесь был голый return: Яна 12.08 нажала /start с нового
+        # аккаунта и не получила НИЧЕГО — ни ответа, ни строки в логах.
+        await note_denied_access(redis_client, BOT_NAME_LOWER, u.id,
+                                 username=u.username or "", first_name=u.first_name or "",
+                                 kind="start")
+        await update.message.reply_text(deny_message())
         return
     from telegram import InlineKeyboardMarkup, InlineKeyboardButton
     kb = InlineKeyboardMarkup([[
@@ -731,6 +740,10 @@ async def find_and_send_photo(update, query: str) -> bool:
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ALLOWED_USERS:
+        u = update.effective_user
+        await note_denied_access(redis_client, BOT_NAME_LOWER, u.id,
+                                 username=u.username or "", first_name=u.first_name or "",
+                                 kind="message")
         return
     if update.effective_chat.type in ["group", "supergroup"]:
         return
