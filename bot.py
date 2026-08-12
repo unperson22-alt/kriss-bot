@@ -1,4 +1,4 @@
-import os, re, logging, asyncio, httpx, random
+import os, re, logging, asyncio, httpx
 from aiohttp import web
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, MessageHandler, MessageReactionHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
@@ -29,6 +29,9 @@ from ai_office_shared.shared.office import (
 )
 from ai_office_shared.shared.prompt import enhance_prompt_ex, intent_hint
 from ai_office_shared.shared.models import MODEL_SONNET
+from ai_office_shared.shared import banter as _banter
+from ai_office_shared.shared import group_history as _ghist
+from ai_office_shared.shared.identity import roster_prompt
 
 
 async def _call_office(agent_name: str, message: str, user_id: int) -> str:
@@ -128,6 +131,9 @@ async def build_system(user_id: int) -> str:
     from ai_office_shared.shared.office import instructions_suffix
     notes = await redis_get_notes(redis_client, BOT_NAME_LOWER, user_id)
     result = SYSTEM_BASE
+    # Ростер офиса фактом: раньше бот знал коллег только по обрывкам
+    # группового чата и путал, кто есть кто.
+    result += "\n\n" + roster_prompt(BOT_NAME)
     if notes:
         result += f"\n\nЗаметки о пользователе:\n{notes}"
     result += await instructions_suffix(redis_client, BOT_NAME_LOWER)
@@ -301,7 +307,9 @@ def _extract_text(content_blocks) -> str:
     return " ".join(texts).strip()
 
 
-async def process(message: str, user_id: int) -> str:
+async def process(message: str, user_id: int,
+                  sender: str = "", short: bool = False) -> str:
+    """sender — кто написал. По HTTP приходил голый текст без автора."""
     # ВАЖНО: в историю идёт ОРИГИНАЛ пользователя, а не вывод enhance-модели.
     # Раньше здесь было `message = await enhance_prompt(...)` — главная модель никогда
     # не видела слов пользователя и на украинском/коротком входе принимала Haiku-артефакт
@@ -312,7 +320,8 @@ async def process(message: str, user_id: int) -> str:
     await log_event(redis_client, BOT_NAME_LOWER, "message_received",
                     user_id=user_id)
     history = await redis_get_history(redis_client, BOT_NAME_LOWER, user_id)
-    history.append({"role": "user", "content": message})
+    history.append({"role": "user",
+                    "content": f"[от {sender}] {message}" if sender else message})
     if len(history) > 20:
         history = history[-10:]
 
@@ -323,7 +332,7 @@ async def process(message: str, user_id: int) -> str:
         """Один чистый вызов Claude с web_search (server-side tool — loop не нужен)."""
         return await claude_async.messages.create(
             model=MODEL_SONNET,
-            max_tokens=4096,
+            max_tokens=150 if short else 4096,
             system=system,
             messages=msgs,
             tools=WEB_SEARCH_TOOL
@@ -451,6 +460,10 @@ async def send_to_group(text: str):
             if data.get("ok"):
                 msg_id = data["result"]["message_id"]
                 await remember_my_message(int(OFFICE_CHAT_ID), msg_id)
+                # В общую ленту: Telegram не доставляет сообщения ботов
+                # ботам, office:group:history — единственный канал, где
+                # коллеги видят, что было сказано.
+                await _ghist.push(redis_client, BOT_NAME, text)
                 return msg_id
     except Exception as e:
         logger.error(f"send_to_group failed: {e}")
@@ -619,14 +632,17 @@ async def handle_task(request):
         data    = await request.json()
         message = data.get("message", "")
         user_id = data.get("user_id", YOUR_TELEGRAM_ID)
-        sender  = data.get("sender", "HTTP")
+        sender  = _banter.sender_of(data) or data.get("sender", "HTTP")
+        is_banter = _banter.is_banter(data)
         if not message:
             return web.json_response({"error": "empty message"}, status=400)
         await log("MSG_IN", message, from_=sender, to_=BOT_NAME)
         await log_event(redis_client, BOT_NAME_LOWER, "task_received",
                         user_id=user_id, via="http")
-        response = await process(message, user_id)
-        if data.get("notify", True):
+        response = await process(message, user_id,
+                                 sender=sender if sender != "HTTP" else "",
+                                 short=is_banter)
+        if is_banter or data.get("notify", True):
             await send_to_group(f"Крис:\n{response}")
         await log("MSG_OUT", f"{BOT_NAME}: {response}", from_=BOT_NAME, to_=sender)
         return web.json_response({"status": "ok", "response": response})
@@ -917,24 +933,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"[КРИСС voice] {e}")
         await msg.reply_text("Ошибка обработки голоса 🙈")
 
-BOT_REPLY_CHANCE = 0.2  # шанс ответить на сообщение бота в группе
-
-async def handle_group_bot_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Реагирует на сообщения ботов в группе с шансом 20%."""
-    if not update.message or not update.message.text:
-        return
-    sender = update.effective_user
-    if not sender or not sender.is_bot:
-        return
-    if update.effective_chat.type not in ["group", "supergroup"]:
-        return
-    if random.random() >= BOT_REPLY_CHANCE:
-        return
-    msg = update.message.text
-    user_id = sender.id
-    response = await process(msg, user_id)
-    if response:
-        await update.message.reply_text(response)
+# handle_group_bot_message удалён: Telegram не доставляет боту сообщения других
+# ботов, шанс 20% не разыгрывался ни разу. Межботовые реплики идут по HTTP /task
+# (ai_office_shared.shared.banter), их оркестрирует Филли.
 
 async def main():
     global redis_client
@@ -960,7 +961,6 @@ async def main():
     # IMAGE_FILTER = PHOTO | Document.IMAGE — картинка файлом раньше не ловилась вовсе.
     ptb.add_handler(MessageHandler(IMAGE_FILTER, handle_photo))
     ptb.add_handler(MessageHandler(filters.VOICE, handle_voice))
-    ptb.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS, handle_group_bot_message))
     ptb.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     ptb.add_handler(MessageReactionHandler(handle_reaction))
