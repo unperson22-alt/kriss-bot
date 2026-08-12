@@ -3,5 +3,5 @@ anthropic
 aiohttp
 httpx
 redis>=4.2.0
-ai-office-shared @ git+https://github.com/unperson22-alt/ai-office-shared.git@a9716a78848c308ff5a3cb1334b99fdcf9ddfddd
+ai-office-shared @ git+https://github.com/unperson22-alt/ai-office-shared.git@d6fcf89607cdf43f302c8f6a40cb3653ef664a38
 # trigger redeploy
