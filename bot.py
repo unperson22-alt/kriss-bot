@@ -670,16 +670,25 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                  kind="start")
         await update.message.reply_text(deny_message())
         return
+    # Приём тоже пишем в лог, не только отказ. Иначе успешный /start остаётся
+    # таким же невидимым, каким был отказ до 12.08: человек поздоровался, а в
+    # офис-группе пусто — и снова непонятно, дошло вообще или нет.
+    who = u.username or u.first_name or str(u.id)
+    await log("MSG_IN", "/start", from_=who, to_=BOT_NAME)
+    await log_event(redis_client, BOT_NAME_LOWER, "start", user_id=u.id,
+                    username=u.username or "")
+
     from telegram import InlineKeyboardMarkup, InlineKeyboardButton
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("❓ Что умею?", callback_data="kriss_help")
     ]])
-    await update.message.reply_text(
+    greeting = (
         "Привет! Я Крис — твой персональный ассистент.\n"
         "Помогаю с любыми задачами — и не только.\n\n"
-        "Нажми ❓ чтобы узнать что умею, или просто пиши 👇",
-        reply_markup=kb
+        "Нажми ❓ чтобы узнать что умею, или просто пиши 👇"
     )
+    await update.message.reply_text(greeting, reply_markup=kb)
+    await log("MSG_OUT", f"{BOT_NAME}: {greeting}", from_=BOT_NAME, to_=who)
 
 async def send_long(update: Update, text: str, reply_markup=None):
     limit = 4000
