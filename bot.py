@@ -483,9 +483,34 @@ def is_truncated(text: str) -> bool:
 
 
 def _extract_text(content_blocks) -> str:
-    """Извлекаем текст из ответа Claude — работает и с tool_use и без."""
-    texts = [b.text for b in content_blocks if hasattr(b, "text") and b.text]
-    return " ".join(texts).strip()
+    """
+    Текст ответа Claude. При веб-поиске берём то, что сказано ПОСЛЕ поиска.
+
+    Раньше склеивались ВСЕ текстовые блоки. При server-side web_search их
+    несколько: сначала «сейчас поищу актуальные данные», потом сам поиск,
+    потом настоящий ответ. Склейка давала заикание, которое читается как
+    сбой бота: «Хороший вопрос... Давай по-честному. Окей, данные есть.
+    Погнали — это уже не про алгоритмы...» (чат 15.08). Фраза «сейчас поищу»
+    адресована модели, а не читателю.
+
+    Если инструментов не было — поведение прежнее. Если после инструмента
+    модель ничего не сказала, отдаём что есть: пустой ответ пользователь
+    читает как «бот сломался».
+    """
+    blocks = list(content_blocks or [])
+    last_tool = -1
+    for i, b in enumerate(blocks):
+        _t = str(getattr(b, "type", "") or "")
+        if _t.endswith("tool_use") or _t.endswith("tool_result"):
+            last_tool = i
+
+    def _texts(seq):
+        return [b.text for b in seq if getattr(b, "text", None)]
+
+    tail = _texts(blocks[last_tool + 1:]) if last_tool >= 0 else _texts(blocks)
+    if not tail:
+        tail = _texts(blocks)
+    return " ".join(tail).strip()
 
 
 async def process(message: str, user_id: int,
