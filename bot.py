@@ -519,13 +519,20 @@ async def process(message: str, user_id: int,
             tools=WEB_SEARCH_TOOL
         )
 
+    import re as _re
     try:
         r = await _call_claude(history)
         text = _extract_text(r.content)
         if not text:
             text = "⚠️ Не получил ответ от AI. Попробуй ещё раз."
 
-        if is_truncated(text):
+        # Проверяем обрыв на тексте БЕЗ офисного тега. Системный промпт велит
+        # дописывать [OFFICE:ИМЯ:запрос] в КОНЕЦ ответа, а тег кончается на "]",
+        # которого нет в списке завершающих символов. Из-за этого законченный
+        # ответ считался обрезанным: 15.08 Крисс дописал к «Скажи как удобнее!»
+        # ещё один ответ, начинавшийся с «Конечно! Остановился на том, что...» —
+        # то есть модель пересказала инструкцию «продолжи», а не продолжила.
+        if is_truncated(_re.sub(r'\[OFFICE:[^\]]+\]', '', text).strip()):
             logger.warning(f"Truncated response for {user_id}, retrying...")
             r2 = await _call_claude(history + [
                 {"role": "assistant", "content": text},
@@ -534,7 +541,6 @@ async def process(message: str, user_id: int,
             text = text + " " + _extract_text(r2.content)
 
         # Офисный агент если Claude запросил
-        import re as _re
         agent_name, office_query = _parse_office_tag(text)
         clean_text = _re.sub(r'\[OFFICE:[^\]]+\]', '', text).strip()
         if agent_name and office_query:
