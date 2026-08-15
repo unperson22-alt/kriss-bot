@@ -3,5 +3,11 @@ anthropic
 aiohttp
 httpx
 redis>=4.2.0
-ai-office-shared @ git+https://github.com/unperson22-alt/ai-office-shared.git@83841391e073ce365cfbc3ac01cec9f628ba79d1
-# trigger redeploy
+pillow>=10.0.0
+# Вырез/размытие фона и стикеры. ~200 МБ образа и ~530 МБ RSS на модели u2netp —
+# поэтому стоит только у Крисс, остальным ботам не нужен. Без него фильтры,
+# кроп, апскейл и сжатие работают, а запрос «убери фон» честно скажет почему нет.
+rembg[cpu]>=2.0.50
+ai-office-shared @ git+https://github.com/unperson22-alt/ai-office-shared.git@5f02a64088b4c157627d0f09fd07c4a9b07b5f35
+# ↑ коммит ветки claude/photo-processing-bots-8y44wj (модуль shared/photo.py).
+# После мержа ветки в main — перепинить на SHA из main, ветка может быть удалена.

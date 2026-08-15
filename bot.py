@@ -1,6 +1,9 @@
-import os, re, logging, asyncio, httpx
+import os, re, base64, logging, asyncio, httpx
 from aiohttp import web
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import (
+    Update, InlineKeyboardMarkup, InlineKeyboardButton,
+    BotCommand, BotCommandScopeChat, MenuButtonCommands,
+)
 from telegram.ext import Application, MessageHandler, MessageReactionHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
 import anthropic
 from anthropic import AsyncAnthropic
@@ -16,6 +19,9 @@ from ai_office_shared.shared.tasks import (
 )
 from ai_office_shared.shared.media import (
     IMAGE_FILTER, ImageError, addressed_in_group, bot_username, extract_image,
+)
+from ai_office_shared.shared.photo import (
+    PHOTO_HELP, is_photo_request, process_photo,
 )
 from ai_office_shared.shared.dev_escalation import (
     DEV_FEATURE_PROMPT_BLOCK, parse_dev_feature_tag,
@@ -250,6 +256,185 @@ async def notify_owner(text: str) -> None:
     except Exception as e:
         logger.error(f"notify_owner failed: {e}")
 
+# ── ОБРАБОТКА ФОТО ПО КНОПКАМ ────────────────────────────────────────────────
+# Инстаграм режет обработку дневным лимитом. Движок здесь локальный
+# (ai_office_shared.shared.photo, Pillow) — лимита нет, ключей не нужно,
+# фотографии никуда наружу не уходят.
+#
+# Картинку в кнопку не положишь: callback_data ограничен 64 байтами. Поэтому
+# file_id складываем в Redis под номером сообщения, а в кнопку кладём только
+# операцию и номер — по нему потом заново скачиваем оригинал из Telegram.
+
+PHOTO_TTL = 24 * 3600
+
+# Кнопка → фраза для process_photo. Через фразы, а не напрямую в операции:
+# разбор живой речи в shared уже покрыт тестами, дублировать его здесь нечем.
+PHOTO_ACTIONS = {
+    "auto":     ("✨ Улучшить",    "улучши"),
+    "portrait": ("🙂 Портрет",     "портрет"),
+    "soft":     ("🧴 Ретушь",      "ретушь кожи"),
+    "vivid":    ("🌈 Сочное",      "сочное"),
+    "bw":       ("⚫️ Ч/Б",         "чб"),
+    "noir":     ("🎞 Нуар",        "нуар"),
+    "vintage":  ("📻 Винтаж",      "винтаж"),
+    "film":     ("🎬 Плёнка",      "плёнка"),
+    "warm":     ("🔥 Теплее",      "тепло"),
+    "cold":     ("❄️ Холоднее",    "холод"),
+    "matte":    ("🌫 Матовое",     "матовое"),
+    "sharp":    ("🔎 Чётче",       "чётче"),
+    "drama":    ("🌩 Драма",       "драма"),
+    "nobg":     ("✂️ Убрать фон",  "убери фон"),
+    "blurbg":   ("🌁 Размыть фон", "размой фон"),
+    "whitebg":  ("⬜️ Белый фон",   "белый фон"),
+    "sticker":  ("🏷 Стикер",      "стикер"),
+    "square":   ("⬛️ Квадрат",     "квадрат"),
+    "story":    ("📱 Стори",       "стори"),
+    "avatar":   ("👤 Аватар",      "на аву"),
+    "upscale":  ("🔍 Увеличить",   "увеличь"),
+    "compress": ("🗜 Сжать",       "сожми"),
+}
+
+PHOTO_MENUS = {
+    "filters": ["vivid", "bw", "noir", "vintage", "film", "warm", "cold",
+                "matte", "sharp", "drama"],
+    "bg":      ["nobg", "blurbg", "whitebg", "sticker"],
+    "format":  ["square", "story", "avatar", "upscale", "compress"],
+}
+
+
+def _photo_key(chat_id: int, message_id: int) -> str:
+    return f"kriss:photo:{chat_id}:{message_id}"
+
+
+async def remember_photo(chat_id: int, message_id: int, file_id: str) -> None:
+    """file_id живёт сутки — дальше кнопки честно скажут прислать фото заново."""
+    try:
+        await redis_client.setex(_photo_key(chat_id, message_id), PHOTO_TTL, file_id)
+    except Exception as e:
+        logger.warning(f"remember_photo failed: {e}")
+
+
+async def recall_photo(chat_id: int, message_id: int) -> str:
+    try:
+        val = await redis_client.get(_photo_key(chat_id, message_id))
+    except Exception as e:
+        logger.warning(f"recall_photo failed: {e}")
+        return ""
+    if not val:
+        return ""
+    return val.decode() if isinstance(val, bytes) else str(val)
+
+
+def _file_id_of(message) -> str:
+    """Самый большой размер фото либо документ-картинка."""
+    if getattr(message, "photo", None):
+        return message.photo[-1].file_id
+    doc = getattr(message, "document", None)
+    return doc.file_id if doc is not None else ""
+
+
+def photo_keyboard(mid: int, menu: str = "root") -> InlineKeyboardMarkup:
+    """Меню обработки. mid — номер сообщения с оригиналом фото."""
+    if menu == "root":
+        rows = [
+            [InlineKeyboardButton(PHOTO_ACTIONS["auto"][0],     callback_data=f"ph:a:auto:{mid}"),
+             InlineKeyboardButton(PHOTO_ACTIONS["portrait"][0], callback_data=f"ph:a:portrait:{mid}")],
+            [InlineKeyboardButton(PHOTO_ACTIONS["soft"][0],     callback_data=f"ph:a:soft:{mid}"),
+             InlineKeyboardButton("🎨 Фильтры", callback_data=f"ph:m:filters:{mid}")],
+            [InlineKeyboardButton("✂️ Фон",     callback_data=f"ph:m:bg:{mid}"),
+             InlineKeyboardButton("📐 Формат",  callback_data=f"ph:m:format:{mid}")],
+            [InlineKeyboardButton("👁 Что на фото", callback_data=f"ph:v:{mid}")],
+        ]
+        return InlineKeyboardMarkup(rows)
+
+    keys = PHOTO_MENUS.get(menu, [])
+    rows, row = [], []
+    for key in keys:
+        row.append(InlineKeyboardButton(PHOTO_ACTIONS[key][0], callback_data=f"ph:a:{key}:{mid}"))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"ph:m:root:{mid}")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def send_processed(context, chat_id: int, mid: int, raw: bytes, request: str,
+                         reply_markup=None):
+    """
+    Обработать и отдать результат. Документом, а не фото: Telegram пережимает
+    photo и вся обработка становится незаметной.
+    """
+    res = await process_photo(raw, request)
+    if res.error:
+        await context.bot.send_message(chat_id=chat_id, text=res.error,
+                                       reply_to_message_id=mid)
+        return
+    stream, filename = res.as_file()
+    await context.bot.send_document(
+        chat_id=chat_id, document=stream, filename=filename,
+        caption=f"✅ {res.caption}", reply_to_message_id=mid,
+        reply_markup=reply_markup,
+    )
+    await log_event(redis_client, BOT_NAME_LOWER, "photo_processed",
+                    op=res.op, size=len(res.data or b""))
+
+
+async def handle_photo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопки под фото: ph:a:<действие>:<mid> | ph:m:<меню>:<mid> | ph:v:<mid>."""
+    q = update.callback_query
+    if q.from_user.id not in ALLOWED_USERS:
+        await q.answer()
+        return
+
+    parts = q.data.split(":")
+    kind = parts[1]
+    try:
+        mid = int(parts[-1])
+    except ValueError:
+        await q.answer()
+        return
+
+    if kind == "m":
+        await q.answer()
+        await q.edit_message_reply_markup(reply_markup=photo_keyboard(mid, parts[2]))
+        return
+
+    chat_id = q.message.chat_id
+    file_id = await recall_photo(chat_id, mid)
+    if not file_id:
+        # Кнопки живут в истории вечно, file_id — сутки. Молчать нельзя.
+        await q.answer("Это фото уже не помню — пришли заново 🙂", show_alert=True)
+        return
+
+    await q.answer("🎨 Обрабатываю…")
+    try:
+        await context.bot.send_chat_action(chat_id=chat_id, action="upload_document")
+        file_obj = await context.bot.get_file(file_id)
+        raw = bytes(await file_obj.download_as_bytearray())
+
+        if kind == "v":
+            b64 = base64.b64encode(raw).decode()
+            answer = await process_with_image("Что на этом фото? Опиши подробно.",
+                                              q.from_user.id, b64)
+            await context.bot.send_message(chat_id=chat_id, text=answer,
+                                           reply_to_message_id=mid)
+            return
+
+        action = PHOTO_ACTIONS.get(parts[2])
+        if not action:
+            await context.bot.send_message(chat_id=chat_id, text="Не знаю такой кнопки 🤷",
+                                           reply_to_message_id=mid)
+            return
+        await send_processed(context, chat_id, mid, raw, action[1])
+    except Exception as e:
+        logger.error(f"handle_photo_callback error: {e}")
+        spawn(report_bug("handle_photo_callback crashed", str(e)), name="report_bug")
+        await context.bot.send_message(
+            chat_id=chat_id, text="⚠️ Не смог обработать. Попробуй ещё раз.",
+            reply_to_message_id=mid)
+
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Картинки: фотографией И файлом (Document.IMAGE), в ЛС и в группе.
@@ -276,13 +461,40 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(img.user_message)
         return
 
-    caption = img.caption or "Что на этом фото?"
-    await log("MSG_IN", f"[фото] {caption}", from_=user_name, to_=BOT_NAME)
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    chat_id = update.effective_chat.id
+    mid = update.message.message_id
+    file_id = _file_id_of(update.message)
+    if file_id:
+        await remember_photo(chat_id, mid, file_id)
+
+    caption = (img.caption or "").strip()
+    await log("MSG_IN", f"[фото] {caption or '(без подписи)'}", from_=user_name, to_=BOT_NAME)
+
+    # 1) Просьба обработать («убери фон», «винтаж») — делаем сразу.
+    if caption and is_photo_request(caption):
+        await context.bot.send_chat_action(chat_id=chat_id, action="upload_document")
+        try:
+            await send_processed(context, chat_id, mid, base64.b64decode(img.b64), caption,
+                                 reply_markup=photo_keyboard(mid))
+        except Exception as e:
+            logger.error(f"handle_photo processing error: {e}")
+            spawn(report_bug("handle_photo processing crashed", str(e)), name="report_bug")
+            await update.message.reply_text("⚠️ Не смог обработать фото. Попробуй ещё раз.")
+        return
+
+    # 2) Просто фото без подписи — сразу меню, без похода в LLM: Яна кидает
+    #    фотки пачками, платить токенами за описание каждой незачем.
+    if not caption:
+        await update.message.reply_text("Что сделать с фото? 👇",
+                                        reply_markup=photo_keyboard(mid))
+        return
+
+    # 3) Вопрос про фото — отвечаем как раньше, но кнопки обработки оставляем.
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
     try:
         response = await process_with_image(caption, user_id, img.b64, img.media_type)
         await log("MSG_OUT", f"{BOT_NAME}: {response}", from_=BOT_NAME, to_=user_name)
-        await send_long(update, response)
+        await send_long(update, response, reply_markup=photo_keyboard(mid))
     except Exception as e:
         logger.error(f"handle_photo error: {e}")
         spawn(report_bug("handle_photo crashed", str(e)), name="report_bug")
@@ -690,6 +902,134 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(greeting, reply_markup=kb)
     await log("MSG_OUT", f"{BOT_NAME}: {greeting}", from_=BOT_NAME, to_=who)
 
+# ── МЕНЮ КОМАНД ──────────────────────────────────────────────────────────────
+# Синяя кнопка «Меню» в Telegram — это setMyCommands. Без неё базовые функции
+# существуют только в голове у того, кто помнит формулировки.
+
+BOT_COMMANDS = [
+    ("start",  "Знакомство"),
+    ("help",   "Что я умею"),
+    ("photo",  "Обработка фото — что умею с картинками"),
+    ("menu",   "Быстрые действия"),
+    ("tasks",  "Мои задачи и планы"),
+    ("status", "Статус: что сделано, что дальше"),
+    ("note",   "Запомнить заметку"),
+    ("idea",   "Предложить функцию"),
+    ("bug",    "Сообщить о проблеме"),
+    ("reset",  "Очистить контекст диалога"),
+]
+
+
+async def setup_commands(bot) -> None:
+    """
+    Меню команд. Fail-soft: сеть до Telegram на старте отваливается регулярно
+    (урок #95), а меню — не то, ради чего стоит уронить бота. Не проставилось —
+    строка в логе, команды всё равно работают руками.
+    """
+    cmds = [BotCommand(c, d) for c, d in BOT_COMMANDS]
+    try:
+        await bot.set_my_commands(cmds)
+        await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+        for uid in ALLOWED_USERS:
+            try:
+                await bot.set_my_commands(cmds, scope=BotCommandScopeChat(chat_id=uid))
+            except Exception as e:      # чат с ботом ещё не начат — это норма
+                logger.info(f"setup_commands: scope {uid} пропущен ({e})")
+        logger.info(f"Меню команд проставлено: {len(cmds)} шт")
+    except Exception as e:
+        logger.warning(f"setup_commands failed: {e}")
+
+
+def _allowed(update: Update) -> bool:
+    return update.effective_user is not None and update.effective_user.id in ALLOWED_USERS
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _allowed(update):
+        return
+    await update.message.reply_text(KRISS_HELP + "\n\n📸 Про фото — /photo")
+
+
+async def cmd_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _allowed(update):
+        return
+    await update.message.reply_text(
+        PHOTO_HELP + "\n\nИли просто пришли фото — покажу кнопки.")
+
+
+async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _allowed(update):
+        return
+    await update.message.reply_text("Что делаем? 👇", reply_markup=make_task_keyboard())
+
+
+async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _allowed(update):
+        return
+    uid = update.effective_user.id
+    notes = await redis_get_notes(redis_client, BOT_NAME_LOWER, uid)
+    if not notes:
+        await update.message.reply_text(
+            "У меня пока нет записей о твоих задачах. Напиши что нужно сделать — запомню.")
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    await send_long(update, await process("Покажи мой список задач и планов из заметок", uid))
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _allowed(update):
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    await send_long(update, await process(
+        "Дай краткий статус — что я делал, что запланировано, что в приоритете",
+        update.effective_user.id))
+
+
+async def cmd_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/note текст — сразу в заметки; /note без текста — жду следующее сообщение."""
+    if not _allowed(update):
+        return
+    text = " ".join(context.args or []).strip()
+    if not text:
+        context.user_data["pending_note"] = True
+        await update.message.reply_text("Что запомнить? Пиши следующим сообщением.")
+        return
+    await redis_add_note(redis_client, BOT_NAME_LOWER, update.effective_user.id, text)
+    await update.message.reply_text("✅ Запомнила.")
+
+
+async def cmd_idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Фича-реквест — на доску задач dev-dept, а не сообщением в пустоту."""
+    if not _allowed(update):
+        return
+    text = " ".join(context.args or []).strip()
+    if not text:
+        context.user_data["pending_feature"] = True
+        await update.message.reply_text(
+            "Опиши функцию которой не хватает — одним сообщением. Я сразу отправлю Владу.")
+        return
+    who = update.effective_user.first_name or str(update.effective_user.id)
+    task_id = await request_dev_feature(redis_client, BOT_NAME, who, text, notify=notify_owner)
+    await update.message.reply_text(
+        f"✅ Передала в отдел разработки (задача {task_id})." if task_id
+        else "✅ Передала Владу. На доску задач записать не смогла — Redis недоступен.")
+
+
+async def cmd_bug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Жалоба на поломку — в Bug Lessons группу, где её реально читают."""
+    if not _allowed(update):
+        return
+    text = " ".join(context.args or []).strip()
+    if not text:
+        context.user_data["pending_bug"] = True
+        await update.message.reply_text("Что сломалось? Опиши одним сообщением.")
+        return
+    who = update.effective_user.first_name or str(update.effective_user.id)
+    await report_bug(f"жалоба от {who}", text)
+    await notify_owner(f"🐛 {who} через Крис: {text[:500]}")
+    await update.message.reply_text("✅ Записала и передала. Спасибо!")
+
+
 async def send_long(update: Update, text: str, reply_markup=None):
     limit = 4000
     sent = None
@@ -787,6 +1127,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Feature request ──────────────────────────────────────────────────────
     # Раньше уходило простым сообщением в личку мимо доски задач и терялось.
     # Теперь — задача на канонический taskboard (assignee=dev-dept) + уведомление.
+    if context.user_data.pop("pending_note", False):
+        await redis_add_note(redis_client, BOT_NAME_LOWER, user_id, msg)
+        await send_long(update, "✅ Запомнила.")
+        return
+
+    if context.user_data.pop("pending_bug", False):
+        await report_bug(f"жалоба от {user_name}", msg)
+        await notify_owner(f"🐛 {user_name} через Крис: {msg[:500]}")
+        await send_long(update, "✅ Записала и передала. Спасибо!")
+        return
+
     if context.user_data.get("pending_feature"):
         context.user_data.pop("pending_feature", None)
         task_id = await request_dev_feature(
@@ -980,6 +1331,17 @@ async def main():
     ptb.add_handler(CallbackQueryHandler(handle_kriss_help, pattern="^kriss_help$"))
     ptb.add_handler(CommandHandler("reset", cmd_reset))
     ptb.add_handler(CommandHandler("resetall", cmd_reset_all))
+    ptb.add_handler(CommandHandler("help",   cmd_help))
+    ptb.add_handler(CommandHandler("photo",  cmd_photo))
+    ptb.add_handler(CommandHandler("menu",   cmd_menu))
+    ptb.add_handler(CommandHandler("tasks",  cmd_tasks))
+    ptb.add_handler(CommandHandler("status", cmd_status))
+    ptb.add_handler(CommandHandler("note",   cmd_note))
+    ptb.add_handler(CommandHandler("idea",   cmd_idea))
+    ptb.add_handler(CommandHandler("bug",    cmd_bug))
+    # Кнопки обработки фото — ДО общего CallbackQueryHandler ниже, иначе их
+    # съедает он и Яна получает «Хорошо.» вместо обработанной картинки.
+    ptb.add_handler(CallbackQueryHandler(handle_photo_callback, pattern="^ph:"))
     # IMAGE_FILTER = PHOTO | Document.IMAGE — картинка файлом раньше не ловилась вовсе.
     ptb.add_handler(MessageHandler(IMAGE_FILTER, handle_photo))
     ptb.add_handler(MessageHandler(filters.VOICE, handle_voice))
@@ -990,6 +1352,7 @@ async def main():
     async with ptb:
         await ptb.start()
         await ptb.updater.start_polling(drop_pending_updates=True, allowed_updates=["message", "edited_message", "message_reaction", "callback_query"])
+        await setup_commands(ptb.bot)
         logger.info("Крис запущен ✅")
         # spawn() удерживает ссылку: голый create_task позволял GC собрать цикл.
         spawn(weekly_review_loop(redis_client, BOT_NAME_LOWER, claude_async),
