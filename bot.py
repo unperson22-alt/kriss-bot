@@ -23,6 +23,7 @@ from ai_office_shared.shared.media import (
 from ai_office_shared.shared.photo import (
     PHOTO_HELP, is_photo_request, process_photo,
 )
+from ai_office_shared.shared.imagegen import generate_image
 from ai_office_shared.shared.dev_escalation import (
     DEV_FEATURE_PROMPT_BLOCK, parse_dev_feature_tag,
     request_dev_feature, strip_dev_feature_tag,
@@ -158,47 +159,13 @@ def wants_image(text: str) -> bool:
     t = text.lower()
     return any(trigger in t for trigger in IMAGE_TRIGGERS)
 
-REPLICATE_TOKEN  = os.environ.get("REPLICATE_API_TOKEN", "")
+# Генерация картинок живёт в shared/imagegen.py: там перевод промпта на
+# английский (модели не понимают кириллицу — русская просьба давала картинку
+# не по теме), цепочка провайдеров Cloudflare FLUX → Pollinations → Replicate
+# и возврат БАЙТОВ вместо ссылки. Прежние _generate_replicate/_generate_
+# pollinations удалены — они молча возвращали None и отдавали URL, за которым
+# Telegram ходил сам.
 
-async def _generate_replicate(prompt: str) -> str | None:
-    if not REPLICATE_TOKEN:
-        return None
-    try:
-        async with httpx.AsyncClient(timeout=60) as c:
-            r = await c.post(
-                "https://api.replicate.com/v1/models/black-forest-labs/flux-schnell/predictions",
-                headers={"Authorization": f"Bearer {REPLICATE_TOKEN}", "Content-Type": "application/json", "Prefer": "wait"},
-                json={"input": {"prompt": prompt, "num_outputs": 1, "output_format": "webp"}}
-            )
-            if r.status_code in (200, 201):
-                data = r.json()
-                output = data.get("output")
-                if isinstance(output, list) and output:
-                    return output[0]
-                elif isinstance(output, str):
-                    return output
-    except Exception as e:
-        logger.warning(f"_generate_replicate failed: {e}")
-    return None
-
-async def _generate_pollinations(prompt: str) -> str | None:
-    try:
-        import urllib.parse
-        encoded = urllib.parse.quote(prompt)
-        url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&nologo=true"
-        async with httpx.AsyncClient(timeout=30) as c:
-            r = await c.get(url)
-            if r.status_code == 200:
-                return url
-    except Exception as e:
-        logger.warning(f"_generate_pollinations failed: {e}")
-    return None
-
-async def generate_image(prompt: str) -> str | None:
-    url = await _generate_replicate(prompt)
-    if url:
-        return url
-    return await _generate_pollinations(prompt)
 
 async def process_with_image(caption: str, user_id: int, image_b64: str, media_type: str = "image/jpeg") -> str:
     """Claude vision — анализ изображения. Ollama пропускается (не поддерживает vision)."""
@@ -1108,12 +1075,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await redis_add_note(redis_client, BOT_NAME_LOWER, user_id, msg)
 
     if wants_image(msg):
-        await update.message.reply_text("🎨 Рисую, подожди...")
-        url = await generate_image(msg)
-        if url:
-            await update.message.reply_photo(photo=url, caption=f"🎨 {msg[:200]}")
+        note = await update.message.reply_text("🎨 Рисую, подожди...")
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id,
+                                           action="upload_photo")
+        res = await generate_image(msg)
+        try:
+            await note.delete()
+        except Exception:
+            pass
+        if res.ok:
+            # Байты, а не ссылка: за ссылкой Telegram ходил сам и падал на
+            # медленном провайдере уже вне нашего кода.
+            await update.message.reply_photo(photo=res.as_file(), caption=res.caption)
+            await log_event(redis_client, BOT_NAME_LOWER, "image_generated",
+                            provider=res.provider, size=len(res.data or b""))
+            await log("MSG_OUT", f"{BOT_NAME}: [картинка · {res.provider}]",
+                      from_=BOT_NAME, to_=user_name)
         else:
-            await update.message.reply_text("❌ Не получилось нарисовать. Попробуй ещё раз.")
+            await update.message.reply_text(res.error)
         return
 
     if wants_photo_search(msg):
