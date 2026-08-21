@@ -40,7 +40,7 @@ from ai_office_shared.shared.prompt import enhance_prompt_ex, intent_hint
 from ai_office_shared.shared.models import MODEL_SONNET
 from ai_office_shared.shared import banter as _banter
 from ai_office_shared.shared import group_history as _ghist
-from ai_office_shared.shared.identity import roster_prompt
+from ai_office_shared.shared.identity import roster_prompt, speaker_prompt
 
 
 async def _call_office(agent_name: str, message: str, user_id: int) -> str:
@@ -125,6 +125,16 @@ SYSTEM_BASE = """Ты — Крис, персональный ИИ-ассисте
 
 Нельзя: давать устаревшее без предупреждения, выбирать один источник при конфликте без объяснения, подавать непроверенное как факт.
 
+== ФОТО ==
+
+Ты УМЕЕШЬ обрабатывать присланные фотографии сама, локально: ретушь лица (убрать
+дефекты кожи), фильтры, свет и цвет, кроп, фон, стикеры, апскейл. ЗАПРЕЩЕНО
+отвечать «у меня нет инструмента для редактирования изображений» и отправлять
+человека в Snapseed или Photoshop — это ложь, обработка встроена. Если просьба
+про уже присланное фото пришла текстом — она обрабатывается кодом до тебя;
+твоё дело — не отговаривать. Чего действительно нет: рисование новых деталей на
+фото (генеративная замена объектов) — про это скажи честно.
+
 == ОФИСНЫЕ АГЕНТЫ ==
 
 У тебя есть доступ к специалистам AI-офиса. Когда нужны их возможности — добавь в конец ответа тег [OFFICE:ИМЯ:запрос].
@@ -136,13 +146,20 @@ LEARN_TRIGGERS = [
     "remember that", "note that", "always", "never"
 ]
 
-async def build_system(user_id: int) -> str:
+async def build_system(user_id: int, sender: str = "") -> str:
     from ai_office_shared.shared.office import instructions_suffix
     notes = await redis_get_notes(redis_client, BOT_NAME_LOWER, user_id)
     result = SYSTEM_BASE
     # Ростер офиса фактом: раньше бот знал коллег только по обрывкам
     # группового чата и путал, кто есть кто.
     result += "\n\n" + roster_prompt(BOT_NAME)
+    # А это — кто пишет ИМЕННО СЕЙЧАС. Без этой строки ростер отвечает на
+    # вопрос «кто есть кто», но не на вопрос «с кем я говорю», и модель
+    # подставляет самого вероятного: 21.08.2026 Крисс начал ответ Яне со
+    # слова «Влад».
+    who = speaker_prompt(user_id, sender)
+    if who:
+        result += "\n\n" + who
     if notes:
         result += f"\n\nЗаметки о пользователе:\n{notes}"
     result += await instructions_suffix(redis_client, BOT_NAME_LOWER)
@@ -167,10 +184,11 @@ def wants_image(text: str) -> bool:
 # Telegram ходил сам.
 
 
-async def process_with_image(caption: str, user_id: int, image_b64: str, media_type: str = "image/jpeg") -> str:
+async def process_with_image(caption: str, user_id: int, image_b64: str,
+                             media_type: str = "image/jpeg", sender: str = "") -> str:
     """Claude vision — анализ изображения. Ollama пропускается (не поддерживает vision)."""
     history = await redis_get_history(redis_client, BOT_NAME_LOWER, user_id)
-    system = await build_system(user_id)
+    system = await build_system(user_id, sender)
     try:
         r = claude.messages.create(
             model=MODEL_SONNET,
@@ -233,6 +251,9 @@ async def notify_owner(text: str) -> None:
 # операцию и номер — по нему потом заново скачиваем оригинал из Telegram.
 
 PHOTO_TTL = 24 * 3600
+# «Последнее фото» живёт час: просьба вдогонку приходит через секунды, а через
+# сутки «сделай ярче» относилось бы уже к вчерашней картинке.
+LAST_PHOTO_TTL = 3600
 
 # Кнопка → фраза для process_photo. Через фразы, а не напрямую в операции:
 # разбор живой речи в shared уже покрыт тестами, дублировать его здесь нечем.
@@ -273,12 +294,40 @@ def _photo_key(chat_id: int, message_id: int) -> str:
     return f"kriss:photo:{chat_id}:{message_id}"
 
 
+def _last_photo_key(chat_id: int) -> str:
+    return f"kriss:photo:last:{chat_id}"
+
+
 async def remember_photo(chat_id: int, message_id: int, file_id: str) -> None:
-    """file_id живёт сутки — дальше кнопки честно скажут прислать фото заново."""
+    """
+    file_id живёт сутки — дальше кнопки честно скажут прислать фото заново.
+
+    Вторым ключом — «последнее фото в этом чате», на час. Он нужен для самого
+    частого сценария: человек кидает фото, а просьбу пишет СЛЕДУЮЩИМ
+    сообщением («Кріс, можеш прибрати недоліки на обличчі?»). Без него текст
+    приходил в обработчик сообщений, где никакого фото уже нет, и бот отвечал
+    про фото так, будто его не видел (21.08.2026).
+    """
     try:
         await redis_client.setex(_photo_key(chat_id, message_id), PHOTO_TTL, file_id)
+        await redis_client.setex(_last_photo_key(chat_id), LAST_PHOTO_TTL,
+                                 f"{message_id}:{file_id}")
     except Exception as e:
         logger.warning(f"remember_photo failed: {e}")
+
+
+async def recall_last_photo(chat_id: int) -> tuple:
+    """(message_id, file_id) последнего фото в чате или (0, "")."""
+    try:
+        val = await redis_client.get(_last_photo_key(chat_id))
+    except Exception as e:
+        logger.warning(f"recall_last_photo failed: {e}")
+        return 0, ""
+    if not val:
+        return 0, ""
+    raw = val.decode() if isinstance(val, bytes) else str(val)
+    mid, _, file_id = raw.partition(":")
+    return (int(mid) if mid.isdigit() else 0), file_id
 
 
 async def recall_photo(chat_id: int, message_id: int) -> str:
@@ -383,7 +432,8 @@ async def handle_photo_callback(update: Update, context: ContextTypes.DEFAULT_TY
         if kind == "v":
             b64 = base64.b64encode(raw).decode()
             answer = await process_with_image("Что на этом фото? Опиши подробно.",
-                                              q.from_user.id, b64)
+                                              q.from_user.id, b64,
+                                              sender=q.from_user.first_name or "")
             await context.bot.send_message(chat_id=chat_id, text=answer,
                                            reply_to_message_id=mid)
             return
@@ -459,7 +509,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 3) Вопрос про фото — отвечаем как раньше, но кнопки обработки оставляем.
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
     try:
-        response = await process_with_image(caption, user_id, img.b64, img.media_type)
+        response = await process_with_image(caption, user_id, img.b64, img.media_type,
+                                            sender=user_name)
         await log("MSG_OUT", f"{BOT_NAME}: {response}", from_=BOT_NAME, to_=user_name)
         await send_long(update, response, reply_markup=photo_keyboard(mid))
     except Exception as e:
@@ -532,7 +583,7 @@ async def process(message: str, user_id: int,
         history = history[-10:]
 
     # Уточнение — вторично и живёт в системном промпте, а не в реплике пользователя.
-    system = await build_system(user_id) + intent_hint(enh)
+    system = await build_system(user_id, sender) + intent_hint(enh)
 
     async def _call_claude(msgs):
         """Один чистый вызов Claude с web_search (server-side tool — loop не нужен)."""
@@ -1104,6 +1155,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if is_learn_trigger(msg):
         await redis_add_note(redis_client, BOT_NAME_LOWER, user_id, msg)
+
+    # Просьба вдогонку к только что присланному фото. Самый частый порядок:
+    # сначала картинка, потом «прибери недоліки на обличчі» отдельным
+    # сообщением. Раньше текст шёл в LLM без картинки, и та отвечала, что
+    # редактировать изображения не умеет — при рабочем модуле обработки.
+    if is_photo_request(msg):
+        mid, file_id = await recall_last_photo(update.effective_chat.id)
+        if file_id:
+            await context.bot.send_chat_action(chat_id=update.effective_chat.id,
+                                               action="upload_document")
+            try:
+                file_obj = await context.bot.get_file(file_id)
+                raw = bytes(await file_obj.download_as_bytearray())
+                await send_processed(context, update.effective_chat.id, mid, raw, msg,
+                                     reply_markup=photo_keyboard(mid))
+                await log("MSG_OUT", f"{BOT_NAME}: [обработала последнее фото · {msg}]",
+                          from_=BOT_NAME, to_=user_name)
+                return
+            except Exception as e:
+                logger.error(f"handle_message photo follow-up failed: {e}")
+                spawn(report_bug("photo follow-up crashed", str(e)), name="report_bug")
+                await update.message.reply_text(
+                    "⚠️ Фото помню, но обработать не смогла — пришли его ещё раз.")
+                return
 
     if wants_image(msg):
         note = await update.message.reply_text("🎨 Рисую, подожди...")

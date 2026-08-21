@@ -169,5 +169,101 @@ class PhotoButtonsTest(unittest.IsolatedAsyncioTestCase):
                                          b.callback_data)
 
 
+class PhotoFollowUpTest(unittest.IsolatedAsyncioTestCase):
+    """
+    Просьба вдогонку: сначала фото, потом текст отдельным сообщением.
+    Ровно этот порядок 21.08.2026 привёл к ответу «у мене немає інструменту
+    для редагування зображень» при рабочем модуле обработки.
+    """
+
+    async def asyncSetUp(self):
+        self.raw = _jpeg()
+        bot.redis_client = FakeRedis()
+        bot.ALLOWED_USERS = {1}
+        self._log_event, bot.log_event = bot.log_event, AsyncMock()
+        self._log, bot.log = bot.log, AsyncMock()
+        await bot.remember_photo(CHAT_ID, MID, FILE_ID)
+
+    async def asyncTearDown(self):
+        bot.log_event = self._log_event
+        bot.log = self._log
+
+    def _message_update(self, text: str, user_id: int = 1):
+        upd = MagicMock()
+        upd.effective_user.id = user_id
+        upd.effective_user.first_name = "yana"
+        upd.effective_user.username = "yana"
+        upd.effective_chat.id = CHAT_ID
+        upd.effective_chat.type = "private"
+        upd.message.text = text
+        upd.message.reply_text = AsyncMock()
+        return upd
+
+    async def test_last_photo_is_remembered(self):
+        self.assertEqual(await bot.recall_last_photo(CHAT_ID), (MID, FILE_ID))
+
+    async def test_no_photo_in_chat_is_not_a_crash(self):
+        self.assertEqual(await bot.recall_last_photo(CHAT_ID + 1), (0, ""))
+
+    async def test_ukrainian_follow_up_processes_the_photo(self):
+        ctx = _context(self.raw)
+        ctx.user_data = {}
+        upd = self._message_update("Кріс, можеш будь ласка прибрати недоліки на обличчі?")
+        await bot.handle_message(upd, ctx)
+
+        ctx.bot.send_document.assert_awaited_once()
+        data = ctx.bot.send_document.await_args.kwargs["document"].getvalue()
+        self.assertTrue(data.startswith(b"\xff\xd8"))
+        self.assertNotEqual(data, self.raw, "фото вернулось необработанным")
+
+    async def test_ordinary_question_still_goes_to_the_model(self):
+        # «Что на фото?» — это вопрос, а не просьба обработать: обработчик
+        # текста не должен перехватывать всё подряд.
+        ctx = _context(self.raw)
+        ctx.user_data = {}
+        real_process, bot.process = bot.process, AsyncMock(return_value="это кот")
+        try:
+            upd = self._message_update("а что вообще на этом фото?")
+            await bot.handle_message(upd, ctx)
+        finally:
+            bot.process = real_process
+        ctx.bot.send_document.assert_not_awaited()
+
+
+class SpeakerPromptTest(unittest.IsolatedAsyncioTestCase):
+    """Системный промт обязан называть автора сообщения (инцидент 21.08.2026)."""
+
+    async def asyncSetUp(self):
+        bot.redis_client = FakeRedis()
+
+    async def _system_for(self, user_id: int, sender: str = ""):
+        async def _no_notes(*a, **kw):
+            return ""
+        real_notes, bot.redis_get_notes = bot.redis_get_notes, _no_notes
+        real_suffix = None
+        try:
+            import ai_office_shared.shared.office as office
+            real_suffix, office.instructions_suffix = office.instructions_suffix, _no_notes
+            return await bot.build_system(user_id, sender)
+        finally:
+            bot.redis_get_notes = real_notes
+            if real_suffix is not None:
+                office.instructions_suffix = real_suffix
+
+    async def test_yana_is_named_and_vlad_is_excluded(self):
+        system = await self._system_for(8993567246, "yana")
+        self.assertIn("Яна", system)
+        self.assertIn("НЕ Влад", system)
+
+    async def test_owner_gets_his_own_block(self):
+        system = await self._system_for(391077101, "Yodka")
+        self.assertIn("Влад", system)
+        self.assertIn("НЕ Яна", system)
+
+    async def test_photo_capability_is_stated_in_prompt(self):
+        # Бот не должен отказываться от того, что умеет.
+        self.assertIn("ретушь", bot.SYSTEM_BASE.lower())
+
+
 if __name__ == "__main__":
     unittest.main()
