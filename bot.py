@@ -260,7 +260,12 @@ LAST_PHOTO_TTL = 3600
 PHOTO_ACTIONS = {
     "auto":     ("✨ Улучшить",    "улучши"),
     "portrait": ("🙂 Портрет",     "портрет"),
-    "soft":     ("🧴 Ретушь",      "ретушь кожи"),
+    # Ретушь и смягчение — РАЗНЫЕ вещи, и до 21.08.2026 это была одна кнопка:
+    # «🧴 Ретушь» отправляла фразу, которая вела в пресет «нежное», то есть в
+    # размытие всего кадра. Теперь ретушь — отдельная операция (точечно убирает
+    # дефекты кожи), а «нежное» осталось фильтром и живёт в меню фильтров.
+    "retouch":  ("🧴 Ретушь",      "ретушь"),
+    "soft":     ("🕊 Нежное",      "нежное"),
     "vivid":    ("🌈 Сочное",      "сочное"),
     "bw":       ("⚫️ Ч/Б",         "чб"),
     "noir":     ("🎞 Нуар",        "нуар"),
@@ -283,7 +288,7 @@ PHOTO_ACTIONS = {
 }
 
 PHOTO_MENUS = {
-    "filters": ["vivid", "bw", "noir", "vintage", "film", "warm", "cold",
+    "filters": ["soft", "vivid", "bw", "noir", "vintage", "film", "warm", "cold",
                 "matte", "sharp", "drama"],
     "bg":      ["nobg", "blurbg", "whitebg", "sticker"],
     "format":  ["square", "story", "avatar", "upscale", "compress"],
@@ -355,7 +360,7 @@ def photo_keyboard(mid: int, menu: str = "root") -> InlineKeyboardMarkup:
         rows = [
             [InlineKeyboardButton(PHOTO_ACTIONS["auto"][0],     callback_data=f"ph:a:auto:{mid}"),
              InlineKeyboardButton(PHOTO_ACTIONS["portrait"][0], callback_data=f"ph:a:portrait:{mid}")],
-            [InlineKeyboardButton(PHOTO_ACTIONS["soft"][0],     callback_data=f"ph:a:soft:{mid}"),
+            [InlineKeyboardButton(PHOTO_ACTIONS["retouch"][0],  callback_data=f"ph:a:retouch:{mid}"),
              InlineKeyboardButton("🎨 Фильтры", callback_data=f"ph:m:filters:{mid}")],
             [InlineKeyboardButton("✂️ Фон",     callback_data=f"ph:m:bg:{mid}"),
              InlineKeyboardButton("📐 Формат",  callback_data=f"ph:m:format:{mid}")],

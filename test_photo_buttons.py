@@ -161,6 +161,25 @@ class PhotoButtonsTest(unittest.IsolatedAsyncioTestCase):
                     reachable.add(parts[2])
         self.assertEqual(reachable, set(bot.PHOTO_ACTIONS))
 
+    def test_retouch_and_soft_are_separate_buttons(self):
+        """
+        «Ретушь» и «нежное» — разные операции. Одной кнопкой на двоих они были
+        до 21.08.2026, и ретушь тогда означала размытие всего кадра.
+        """
+        from ai_office_shared.shared.photo import parse_request
+        self.assertEqual(parse_request(bot.PHOTO_ACTIONS["retouch"][1]).op, "retouch")
+        soft = parse_request(bot.PHOTO_ACTIONS["soft"][1])
+        self.assertEqual(soft.op, "preset")
+        self.assertEqual(soft.preset, "нежное")
+
+    def test_retouch_is_in_the_root_menu(self):
+        # Ретушь — то, за чем приходят с селфи: она не должна прятаться в
+        # подменю фильтров.
+        root = {b.callback_data.split(":")[2]
+                for row in bot.photo_keyboard(MID).inline_keyboard for b in row
+                if b.callback_data.split(":")[1] == "a"}
+        self.assertIn("retouch", root)
+
     def test_callback_data_fits_telegram_limit(self):
         for menu in ("root", "filters", "bg", "format"):
             for row in bot.photo_keyboard(2 ** 31, menu).inline_keyboard:
