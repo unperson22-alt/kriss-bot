@@ -8,6 +8,6 @@ pillow>=10.0.0
 # поэтому стоит только у Крисс, остальным ботам не нужен. Без него фильтры,
 # кроп, апскейл и сжатие работают, а запрос «убери фон» честно скажет почему нет.
 rembg[cpu]>=2.0.50
-ai-office-shared @ git+https://github.com/unperson22-alt/ai-office-shared.git@9edd8822ac5073a23ac8e5cf7c636b3cc20bec6c
+ai-office-shared @ git+https://github.com/unperson22-alt/ai-office-shared.git@f023951b4ca17e747ca18bbcab00cab0add574ef
 # ↑ SHA из main: модули shared/photo.py, photo_looks.py, photo_ai.py,
 #   photo_retouch.py (ретушь) и identity.speaker_prompt (кто пишет сейчас).
