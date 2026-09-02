@@ -286,3 +286,157 @@ class SpeakerPromptTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FakeTelegram:
+    """
+    Телеграм, который помнит, что мы ему отдали: send_document возвращает
+    сообщение с новым message_id и новым file_id, а get_file по этому file_id
+    отдаёт те самые байты. Без этого цепочку обработок проверить нечем —
+    моки возвращают MagicMock, и «поверх результата» неотличимо от «поверх
+    исходника».
+    """
+
+    def __init__(self, files: dict):
+        self.files = dict(files)            # file_id -> bytes
+        self.next_mid = 100
+        self.sent = []                      # (message_id, file_id, caption)
+        self.markup_edits = []              # (message_id, markup)
+        self.messages = []
+        self.downloaded = []                # какие file_id брали в работу
+
+    async def send_chat_action(self, **kw):
+        return None
+
+    async def send_message(self, **kw):
+        self.messages.append(kw.get("text", ""))
+        return MagicMock()
+
+    async def get_file(self, file_id):
+        self.downloaded.append(file_id)
+        raw = self.files[file_id]
+        obj = MagicMock()
+        obj.download_as_bytearray = AsyncMock(return_value=bytearray(raw))
+        return obj
+
+    async def send_document(self, **kw):
+        self.next_mid += 1
+        file_id = f"out-{self.next_mid}"
+        self.files[file_id] = kw["document"].getvalue()
+        self.sent.append((self.next_mid, file_id, kw.get("caption", "")))
+        msg = MagicMock()
+        msg.message_id = self.next_mid
+        msg.document.file_id = file_id
+        return msg
+
+    async def edit_message_reply_markup(self, **kw):
+        self.markup_edits.append((kw["message_id"], kw["reply_markup"]))
+        return MagicMock()
+
+
+class PhotoChainTest(unittest.IsolatedAsyncioTestCase):
+    """
+    Просьбы складываются в цепочку: «а тепер на цій фотографії додай ч/б» —
+    это чб ПОВЕРХ ретуши, а не чб исходника.
+
+    02.09.2026 Яна получила ровно обратное: ретушь, потом чб оригинала (ретушь
+    пропала), потом на прямую просьбу «одночасно і ретуш і чб» — снова одну
+    ретушь. Здесь заперты оба места: цепочка в shared и память результата тут.
+    """
+
+    async def asyncSetUp(self):
+        self.raw = _jpeg()
+        bot.redis_client = FakeRedis()
+        bot.ALLOWED_USERS = {1}
+        self._log_event, bot.log_event = bot.log_event, AsyncMock()
+        self._log, bot.log = bot.log, AsyncMock()
+        self.tg = FakeTelegram({FILE_ID: self.raw})
+        self.ctx = MagicMock()
+        self.ctx.bot = self.tg
+        self.ctx.user_data = {}
+        # Присланное человеком фото — исходник цепочки.
+        await bot.remember_photo(CHAT_ID, MID, FILE_ID, original=True)
+
+    async def asyncTearDown(self):
+        bot.log_event = self._log_event
+        bot.log = self._log
+
+    def _update(self, text: str):
+        upd = MagicMock()
+        upd.effective_user.id = 1
+        upd.effective_user.first_name = "yana"
+        upd.effective_chat.id = CHAT_ID
+        upd.effective_chat.type = "private"
+        upd.message.text = text
+        upd.message.reply_text = AsyncMock()
+        return upd
+
+    async def test_result_becomes_the_photo_for_the_next_request(self):
+        await bot.handle_message(self._update("ретуш"), self.ctx)
+        first_mid, first_file, _ = self.tg.sent[-1]
+        self.assertEqual(await bot.recall_last_photo(CHAT_ID), (first_mid, first_file))
+
+        await bot.handle_message(self._update("а тепер додай ч/б фільтр"), self.ctx)
+        self.assertEqual(len(self.tg.sent), 2)
+        # Главное: в работу взяли результат ретуши, а НЕ исходник. Проверка
+        # именно по скачанному file_id — «результат отличается от исходника»
+        # прошло бы и в сломанном случае: чб оригинала тоже от него отличается.
+        self.assertEqual(self.tg.downloaded[-1], first_file)
+        self.assertNotIn(FILE_ID, self.tg.downloaded[1:])
+
+    async def test_buttons_under_the_result_work_on_the_result(self):
+        await bot.handle_message(self._update("ретуш"), self.ctx)
+        new_mid, new_file, _ = self.tg.sent[-1]
+
+        self.assertTrue(self.tg.markup_edits, "клавиатуру не перевесили")
+        edited_mid, markup = self.tg.markup_edits[-1]
+        self.assertEqual(edited_mid, new_mid)
+        for row in markup.inline_keyboard:
+            for b in row:
+                self.assertTrue(b.callback_data.endswith(f":{new_mid}"), b.callback_data)
+        # И этот mid действительно ведёт к результату.
+        self.assertEqual(await bot.recall_photo(CHAT_ID, new_mid), new_file)
+
+    async def test_original_is_still_reachable(self):
+        await bot.handle_message(self._update("ретуш"), self.ctx)
+        await bot.handle_message(self._update("зроби чб з оригіналу"), self.ctx)
+
+        self.assertEqual(len(self.tg.sent), 2)
+        self.assertEqual(await bot.recall_original_photo(CHAT_ID), (MID, FILE_ID))
+        # «З оригіналу» — единственный способ выйти из цепочки: взяли исходник.
+        self.assertEqual(self.tg.downloaded[-1], FILE_ID)
+
+    async def test_result_does_not_overwrite_the_original(self):
+        await bot.handle_message(self._update("ретуш"), self.ctx)
+        await bot.handle_message(self._update("винтаж"), self.ctx)
+        self.assertEqual(await bot.recall_original_photo(CHAT_ID), (MID, FILE_ID))
+
+    async def test_compound_request_is_one_message_with_both_steps(self):
+        await bot.handle_message(
+            self._update("Мені потрібно на одній фотографії одночасно і ретуш і чб фільтр"),
+            self.ctx)
+        self.assertEqual(len(self.tg.sent), 1, "два шага — но всё равно один ответ")
+        caption = self.tg.sent[-1][2]
+        self.assertIn("·", caption, f"подпись не перечислила оба шага: {caption}")
+        self.assertLessEqual(len(caption), 1024, "Telegram обрежет такую подпись")
+
+    async def test_button_result_also_carries_its_own_menu(self):
+        """
+        Кнопка «🧴 Ретушь» → результат с МЕНЮ на себя. Иначе следующий шаг
+        человек делает кнопкой под исходником и теряет ретушь — та же потеря,
+        что и в текстовом сценарии, только молча.
+        """
+        q = MagicMock()
+        q.data = f"ph:a:retouch:{MID}"
+        q.from_user.id = 1
+        q.from_user.first_name = "yana"
+        q.message.chat_id = CHAT_ID
+        q.answer = AsyncMock()
+        q.edit_message_reply_markup = AsyncMock()
+        upd = MagicMock()
+        upd.callback_query = q
+
+        await bot.handle_photo_callback(upd, self.ctx)
+        new_mid, new_file, _ = self.tg.sent[-1]
+        self.assertEqual(self.tg.markup_edits[-1][0], new_mid)
+        self.assertEqual(await bot.recall_photo(CHAT_ID, new_mid), new_file)
