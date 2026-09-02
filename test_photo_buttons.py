@@ -284,6 +284,70 @@ class SpeakerPromptTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ретушь", bot.SYSTEM_BASE.lower())
 
 
+
+class TestBuildIsCheckable(unittest.TestCase):
+    """
+    «Смёржено» и «работает» — разные вещи, и второе должно быть проверяемо
+    без участия того, кто деплоил.
+
+    02.09.2026 фикс ретуши уехал в main, SHA пакета в requirements подняли, обе
+    ветки смёржили — а единственным свидетельством того, что Яна увидит новый
+    результат, был текст Силли «✅ kriss-bot задеплоен». `/health` отвечает
+    одинаково до и после деплоя, поэтому опровергнуть или подтвердить это было
+    нечем (инвариант 5: кто сделал работу, тот её не принимает).
+    """
+
+    def test_version_route_is_registered(self):
+        import inspect
+        source = inspect.getsource(bot)
+        self.assertIn('add_get("/version"', source,
+                      "нет /version — версию запущенного кода снова не у кого "
+                      "спросить, кроме исполнителя деплоя")
+
+    def test_version_body_shows_both_commits(self):
+        from ai_office_shared.shared.build_info import build_info
+        info = build_info("крисс")
+        self.assertEqual(set(info), {"bot", "service_commit", "shared_commit"})
+        self.assertEqual(info["bot"], "крисс")
+
+
+class TestEmptyTaskIsRefusedByName(unittest.TestCase):
+    """Отказ обязан называть поле, иначе он не экономит вызывающему ничего."""
+
+    def test_refusal_names_the_expected_and_the_received_field(self):
+        from ai_office_shared.shared.task_request import EmptyTask, task_text
+        with self.assertRaises(EmptyTask) as caught:
+            task_text({"task": "зроби ретуш"})
+        self.assertIn("message", caught.exception.detail)
+        self.assertIn("task", caught.exception.detail)
+
+
+
+class TestSharedPinIsExact(unittest.TestCase):
+    """
+    SHA пакета в requirements обязан быть полным.
+
+    02.09.2026 при подъёме версии SHA был взят `git rev-parse main` из НЕ ТОГО
+    репозитория: команда отработала, requirements выглядел валидным, и поймать
+    это можно было только тем, что коммит не резолвится в ai-office-shared.
+    Полный сорокасимвольный SHA не ловит «валидный, но чужой» — для этого есть
+    GET /version после деплоя, — зато ловит обрезанный и подсунутое имя ветки,
+    которые молча дают «последний коммит ветки» вместо закреплённого.
+    """
+
+    def test_pin_is_a_full_forty_char_sha(self):
+        import os
+        import re
+        here = os.path.dirname(os.path.abspath(__file__))
+        req = open(os.path.join(here, "requirements.txt"), encoding="utf-8").read()
+        found = re.findall(r"ai-office-shared\s*@\s*git\+[^@\s]+@(\S+)", req)
+        self.assertEqual(len(found), 1, "ожидалась ровно одна привязка пакета")
+        pin = found[0]
+        self.assertRegex(pin, r"^[0-9a-f]{40}$",
+                         f"привязка {pin!r} — не полный SHA: обрезанный или имя "
+                         "ветки дадут «последний коммит», а не закреплённый")
+
+
 if __name__ == "__main__":
     unittest.main()
 
