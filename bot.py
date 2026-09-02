@@ -8,7 +8,9 @@ from telegram.ext import Application, MessageHandler, MessageReactionHandler, Co
 import anthropic
 from anthropic import AsyncAnthropic
 import redis.asyncio as aioredis
+from ai_office_shared.shared.build_info import build_info
 from ai_office_shared.shared.logging import log_event
+from ai_office_shared.shared.task_request import EmptyTask, task_text
 from ai_office_shared.shared.redis_helpers import (
     redis_get_history, redis_save_history,
     redis_get_notes, redis_add_note,
@@ -954,12 +956,19 @@ async def handle_task(request):
         return web.json_response({"error": "unauthorized"}, status=401)
     try:
         data    = await request.json()
-        message = data.get("message", "")
+        # Отказ по общему правилу офиса, а не «empty message». 02.09.2026
+        # Силли ответила приветствием на команду, ушедшую полем `task`, и
+        # полчаса ушло на поиск дефекта не там. Крисс пустую заявку отвергала
+        # и раньше — но ответом, который не называл ни нужного поля, ни того,
+        # что пришло вместо него, то есть возвращала вызывающего туда же,
+        # откуда он пришёл. Разбор — ai_office_shared/shared/task_request.py.
+        try:
+            message = task_text(data)
+        except EmptyTask as empty:
+            return web.json_response({"error": empty.detail}, status=400)
         user_id = data.get("user_id", YOUR_TELEGRAM_ID)
         sender  = _banter.sender_of(data) or data.get("sender", "HTTP")
         is_banter = _banter.is_banter(data)
-        if not message:
-            return web.json_response({"error": "empty message"}, status=400)
         await log("MSG_IN", message, from_=sender, to_=BOT_NAME)
         await log_event(redis_client, BOT_NAME_LOWER, "task_received",
                         user_id=user_id, via="http")
@@ -1472,6 +1481,11 @@ async def main():
     app_http.router.add_post("/task",           handle_task)
     app_http.router.add_post("/send_scheduled", handle_send_scheduled)
     app_http.router.add_get("/health",          lambda r: web.json_response({"status":"ok","bot":"крисс"}))
+    # `/health` отвечает «жив», а не «тот самый»: он одинаков до деплоя и
+    # после. 02.09.2026 фикс ретуши был смёржен и SHA пакета поднят, но узнать,
+    # что крутится у Крисс на самом деле, было можно только из текста Силли
+    # «✅ задеплоен» — подписи исполнителя под собственной работой (инвариант 5).
+    app_http.router.add_get("/version",         lambda r: web.json_response(build_info("крисс")))
     app_http.router.add_post("/reply",          handle_reply)
     runner = web.AppRunner(app_http)
     await runner.setup()
