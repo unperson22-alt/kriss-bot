@@ -21,7 +21,7 @@ from ai_office_shared.shared.media import (
     IMAGE_FILTER, ImageError, addressed_in_group, bot_username, extract_image,
 )
 from ai_office_shared.shared.photo import (
-    PHOTO_HELP, is_photo_request, process_photo,
+    PHOTO_HELP, is_photo_request, process_photo, wants_original,
 )
 from ai_office_shared.shared.imagegen import generate_image
 from ai_office_shared.shared.dev_escalation import (
@@ -134,6 +134,12 @@ SYSTEM_BASE = """Ты — Крис, персональный ИИ-ассисте
 про уже присланное фото пришла текстом — она обрабатывается кодом до тебя;
 твоё дело — не отговаривать. Чего действительно нет: рисование новых деталей на
 фото (генеративная замена объектов) — про это скажи честно.
+
+Обработки КОМБИНИРУЮТСЯ в одном сообщении: «ретушь и чб» = и ретушь, и
+чёрно-белое на одной фотографии, порядок слов не важен. Просьба вдогонку («а
+теперь добавь чб») ложится на ПОСЛЕДНИЙ результат, а не на исходник — чтобы
+начать заново, говорят «с оригинала» или жмут кнопки под первым фото. Если
+спрашивают, умеешь ли ты так, — ответ «да», и покажи пример фразы.
 
 == ОФИСНЫЕ АГЕНТЫ ==
 
@@ -303,7 +309,12 @@ def _last_photo_key(chat_id: int) -> str:
     return f"kriss:photo:last:{chat_id}"
 
 
-async def remember_photo(chat_id: int, message_id: int, file_id: str) -> None:
+def _orig_photo_key(chat_id: int) -> str:
+    return f"kriss:photo:orig:{chat_id}"
+
+
+async def remember_photo(chat_id: int, message_id: int, file_id: str,
+                         original: bool = False) -> None:
     """
     file_id живёт сутки — дальше кнопки честно скажут прислать фото заново.
 
@@ -312,11 +323,21 @@ async def remember_photo(chat_id: int, message_id: int, file_id: str) -> None:
     сообщением («Кріс, можеш прибрати недоліки на обличчі?»). Без него текст
     приходил в обработчик сообщений, где никакого фото уже нет, и бот отвечал
     про фото так, будто его не видел (21.08.2026).
+
+    Обработанный результат запоминается тем же способом — поэтому «а тепер на
+    цій фотографії додай ч/б» ложится НА РЕТУШЬ, а не на исходник. Так было не
+    всегда: до 02.09.2026 «последним» оставалось только присланное человеком
+    фото, каждая просьба вдогонку начиналась с нуля и предыдущая обработка
+    молча пропадала. Исходник при этом не теряется: под ним остались свои
+    кнопки, и его помнит отдельный ключ (original=True).
     """
     try:
         await redis_client.setex(_photo_key(chat_id, message_id), PHOTO_TTL, file_id)
         await redis_client.setex(_last_photo_key(chat_id), LAST_PHOTO_TTL,
                                  f"{message_id}:{file_id}")
+        if original:
+            await redis_client.setex(_orig_photo_key(chat_id), LAST_PHOTO_TTL,
+                                     f"{message_id}:{file_id}")
     except Exception as e:
         logger.warning(f"remember_photo failed: {e}")
 
@@ -327,6 +348,20 @@ async def recall_last_photo(chat_id: int) -> tuple:
         val = await redis_client.get(_last_photo_key(chat_id))
     except Exception as e:
         logger.warning(f"recall_last_photo failed: {e}")
+        return 0, ""
+    if not val:
+        return 0, ""
+    raw = val.decode() if isinstance(val, bytes) else str(val)
+    mid, _, file_id = raw.partition(":")
+    return (int(mid) if mid.isdigit() else 0), file_id
+
+
+async def recall_original_photo(chat_id: int) -> tuple:
+    """(message_id, file_id) последнего фото, присланного ЧЕЛОВЕКОМ, или (0, "")."""
+    try:
+        val = await redis_client.get(_orig_photo_key(chat_id))
+    except Exception as e:
+        logger.warning(f"recall_original_photo failed: {e}")
         return 0, ""
     if not val:
         return 0, ""
@@ -392,11 +427,28 @@ async def send_processed(context, chat_id: int, mid: int, raw: bytes, request: s
                                        reply_to_message_id=mid)
         return
     stream, filename = res.as_file()
-    await context.bot.send_document(
+    sent = await context.bot.send_document(
         chat_id=chat_id, document=stream, filename=filename,
         caption=f"✅ {res.caption}", reply_to_message_id=mid,
         reply_markup=reply_markup,
     )
+
+    # Результат — тоже фото, с которым можно работать дальше. Запоминаем его и
+    # перевешиваем кнопки на НЕГО: «⚫️ Ч/Б» под отретушированным кадром должна
+    # делать чб отретушированного, а не заново тянуть исходник (до 02.09.2026
+    # делала именно это — обработка терялась на каждом шаге).
+    out_id = getattr(getattr(sent, "document", None), "file_id", "")
+    if out_id:
+        await remember_photo(chat_id, sent.message_id, out_id)
+        if reply_markup is not None:
+            try:
+                await context.bot.edit_message_reply_markup(
+                    chat_id=chat_id, message_id=sent.message_id,
+                    reply_markup=photo_keyboard(sent.message_id))
+            except Exception as e:
+                # Кнопки остались от исходника — работают, просто на нём.
+                logger.warning(f"photo keyboard repoint failed: {e}")
+
     await log_event(redis_client, BOT_NAME_LOWER, "photo_processed",
                     op=res.op, size=len(res.data or b""))
 
@@ -448,7 +500,11 @@ async def handle_photo_callback(update: Update, context: ContextTypes.DEFAULT_TY
             await context.bot.send_message(chat_id=chat_id, text="Не знаю такой кнопки 🤷",
                                            reply_to_message_id=mid)
             return
-        await send_processed(context, chat_id, mid, raw, action[1])
+        # Меню — и под результатом тоже: без него следующий шаг («а теперь чб»)
+        # пришлось бы делать кнопкой под ИСХОДНИКОМ, то есть терять ретушь.
+        # send_processed перевесит клавиатуру на новое сообщение.
+        await send_processed(context, chat_id, mid, raw, action[1],
+                             reply_markup=photo_keyboard(mid))
     except Exception as e:
         logger.error(f"handle_photo_callback error: {e}")
         spawn(report_bug("handle_photo_callback crashed", str(e)), name="report_bug")
@@ -487,7 +543,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mid = update.message.message_id
     file_id = _file_id_of(update.message)
     if file_id:
-        await remember_photo(chat_id, mid, file_id)
+        await remember_photo(chat_id, mid, file_id, original=True)
 
     caption = (img.caption or "").strip()
     await log("MSG_IN", f"[фото] {caption or '(без подписи)'}", from_=user_name, to_=BOT_NAME)
@@ -1166,7 +1222,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # сообщением. Раньше текст шёл в LLM без картинки, и та отвечала, что
     # редактировать изображения не умеет — при рабочем модуле обработки.
     if is_photo_request(msg):
-        mid, file_id = await recall_last_photo(update.effective_chat.id)
+        chat_id = update.effective_chat.id
+        # По умолчанию — поверх последнего результата: «а тепер додай ч/б»
+        # означает «к этой фотографии», то есть к той, что на экране.
+        # «З оригіналу» — единственный способ сказать «начни заново».
+        if wants_original(msg):
+            mid, file_id = await recall_original_photo(chat_id)
+        else:
+            mid, file_id = await recall_last_photo(chat_id)
         if file_id:
             await context.bot.send_chat_action(chat_id=update.effective_chat.id,
                                                action="upload_document")
