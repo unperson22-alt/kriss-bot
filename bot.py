@@ -41,7 +41,7 @@ from ai_office_shared.shared.office import (
 from ai_office_shared.shared.prompt import enhance_prompt_ex, intent_hint
 from ai_office_shared.shared.models import MODEL_SONNET
 from ai_office_shared.shared import banter as _banter
-from ai_office_shared.shared import group_history as _ghist
+from ai_office_shared.shared import group_post as _gpost
 from ai_office_shared.shared.identity import roster_prompt, speaker_prompt
 
 
@@ -773,27 +773,23 @@ async def log(event: str, msg: str, from_: str = "", to_: str = ""):
     except Exception:
         pass
 
-async def send_to_group(text: str):
-    if not OFFICE_CHAT_ID:
-        return None
-    try:
-        async with httpx.AsyncClient() as c:
-            r = await c.post(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                json={"chat_id": OFFICE_CHAT_ID, "text": text}, timeout=10
-            )
-            data = r.json()
-            if data.get("ok"):
-                msg_id = data["result"]["message_id"]
-                await remember_my_message(int(OFFICE_CHAT_ID), msg_id)
-                # В общую ленту: Telegram не доставляет сообщения ботов
-                # ботам, office:group:history — единственный канал, где
-                # коллеги видят, что было сказано.
-                await _ghist.push(redis_client, BOT_NAME, text)
-                return msg_id
-    except Exception as e:
-        logger.error(f"send_to_group failed: {e}")
-    return None
+async def send_to_group(text: str) -> _gpost.PostResult:
+    """
+    Отправить в офис-группу и вернуть УЛИКУ доставки, а не догадку о ней.
+
+    Возвращает PostResult, а не message_id: прежний `int | None` схлопывал
+    «chat_id не задан», «Telegram отказал» и «сеть легла» в одно молчание,
+    которое снаружи неотличимо от успеха. 10.09.2026 Милли и Доктор
+    отчитались в Log-бот за реплики, которых в группе не было — обоснование
+    и разбор в ai_office_shared/shared/group_post.py.
+    """
+    res = await _gpost.post_to_group(
+        token=TELEGRAM_TOKEN, chat_id=OFFICE_CHAT_ID, text=text,
+        sender_name=BOT_NAME, redis_client=redis_client, bot=BOT_NAME_LOWER,
+    )
+    if res.ok and res.message_id is not None:
+        await remember_my_message(res.chat_id_int, res.message_id)
+    return res
 
 
 # ── FEEDBACK LOOP: msg owner mapping for reactions ───────────────────────────
@@ -975,9 +971,21 @@ async def handle_task(request):
         response = await process(message, user_id,
                                  sender=sender if sender != "HTTP" else "",
                                  short=is_banter)
+        _res = None
         if is_banter or data.get("notify", True):
-            await send_to_group(f"Крис:\n{response}")
-        await log("MSG_OUT", f"{BOT_NAME}: {response}", from_=BOT_NAME, to_=sender)
+            _res = await send_to_group(f"Крис:\n{response}")
+        # Отчёт — по факту, а не по замыслу. Раньше MSG_OUT стоял безусловно,
+        # а результат send_to_group выбрасывался: 10.09.2026 Милли и Доктор
+        # отчитались за реплики, которых в группе не было, и разбор ушёл в
+        # болталку — туда, где всё исправно (инварианты №4, №5).
+        if _res is None:
+            # В группу не постили: notify-гейт закрыт, ответ уезжает Филли по
+            # HTTP. Этот MSG_OUT про ответ, и он правдив.
+            await log("MSG_OUT", f"{BOT_NAME}: {response}",
+                      from_=BOT_NAME, to_=sender)
+        else:
+            await _gpost.log_delivery(log, _res, text=f"{BOT_NAME}: {response}",
+                                      agent=BOT_NAME)
         return web.json_response({"status": "ok", "response": response})
     except Exception as e:
         logger.error(f"/task error: {e}")
