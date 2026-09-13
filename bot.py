@@ -773,19 +773,23 @@ async def log(event: str, msg: str, from_: str = "", to_: str = ""):
     except Exception:
         pass
 
-async def send_to_group(text: str) -> _gpost.PostResult:
+async def send_to_group(text: str, thread_id: str = "") -> _gpost.PostResult:
     """
     Отправить в офис-группу и вернуть УЛИКУ доставки, а не догадку о ней.
 
     Возвращает PostResult, а не message_id: прежний `int | None` схлопывал
     «chat_id не задан», «Telegram отказал» и «сеть легла» в одно молчание,
-    которое снаружи неотличимо от успеха. 10.09.2026 Милли и Доктор
-    отчитались в Log-бот за реплики, которых в группе не было — обоснование
-    и разбор в ai_office_shared/shared/group_post.py.
+    которое снаружи неотличимо от успеха (10.09.2026). Разбор — в
+    ai_office_shared/shared/group_post.py.
+
+    thread_id — нить всплеска болталки. Уезжает в ленту вместе с репликой,
+    чтобы следующая волна собирала транскрипт по ОДНОМУ разговору, а не
+    окном по всей истории офиса (13.09.2026, shared/banter.py).
     """
     res = await _gpost.post_to_group(
         token=TELEGRAM_TOKEN, chat_id=OFFICE_CHAT_ID, text=text,
         sender_name=BOT_NAME, redis_client=redis_client, bot=BOT_NAME_LOWER,
+        thread_id=thread_id,
     )
     if res.ok and res.message_id is not None:
         await remember_my_message(res.chat_id_int, res.message_id)
@@ -965,6 +969,10 @@ async def handle_task(request):
         user_id = data.get("user_id", YOUR_TELEGRAM_ID)
         sender  = _banter.sender_of(data) or data.get("sender", "HTTP")
         is_banter = _banter.is_banter(data)
+        # Нить всплеска: уедет в ленту вместе с репликой, чтобы следующая
+        # волна собрала транскрипт по ОДНОМУ разговору, а не окном по всей
+        # истории офиса. Пусто — вызов не из болталки.
+        _thread = _banter.thread_of(data)
         await log("MSG_IN", message, from_=sender, to_=BOT_NAME)
         await log_event(redis_client, BOT_NAME_LOWER, "task_received",
                         user_id=user_id, via="http")
@@ -978,7 +986,7 @@ async def handle_task(request):
             # диагноз?» — подпись дважды. Крисс была единственной, кто ставил
             # префикс кодом; у остальных его иногда добавляет модель, и это
             # снимается на общем пути в shared/group_post.
-            _res = await send_to_group(response)
+            _res = await send_to_group(response, thread_id=_thread)
         # Отчёт — по факту, а не по замыслу. Раньше MSG_OUT стоял безусловно,
         # а результат send_to_group выбрасывался: 10.09.2026 Милли и Доктор
         # отчитались за реплики, которых в группе не было, и разбор ушёл в
